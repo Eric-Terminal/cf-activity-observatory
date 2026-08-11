@@ -1,0 +1,11 @@
+# Cloudflare API Token：仅授予 Account Analytics Read 与 Zone Read。
+CLOUDFLARE_API_TOKEN="replace-with-api-token"
+
+# 生成方式：openssl rand -base64 32
+CONFIG_ENCRYPTION_KEY="replace-with-32-byte-base64-key"
+
+# 例如 example.cloudflareaccess.com，不要包含路径。
+ACCESS_TEAM_DOMAIN="replace-with-team.cloudflareaccess.com"
+
+# Access 自托管应用的 AUD 标签。
+ACCESS_AUD="replace-with-access-audience"

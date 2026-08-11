@@ -1,0 +1,73 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "cf-activity-observatory",
+  "main": "./src/worker/index.ts",
+  "compatibility_date": "2026-08-04",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "preview_urls": false,
+  "vars": {
+    "ENVIRONMENT": "production",
+    "GRAPHQL_API_URL": "https://api.cloudflare.com/client/v4/graphql",
+    "CLOUDFLARE_API_URL": "https://api.cloudflare.com/client/v4",
+    "SAFE_PAGE_SIZE": "250",
+    "D1_WARNING_BYTES": "419430400",
+    "DEFAULT_POLL_INTERVAL_MINUTES": "5",
+    "DEFAULT_RETENTION_DAYS": "90"
+  },
+  "secrets": {
+    "required": [
+      "CLOUDFLARE_API_TOKEN",
+      "CONFIG_ENCRYPTION_KEY",
+      "ACCESS_TEAM_DOMAIN",
+      "ACCESS_AUD"
+    ]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "cf-activity-observatory",
+      "migrations_dir": "./migrations"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "ARCHIVES",
+      "bucket_name": "cf-activity-observatory-archives"
+    }
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "COLLECTOR_QUEUE",
+        "queue": "cf-activity-observatory"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "cf-activity-observatory",
+        "max_batch_size": 1,
+        "max_batch_timeout": 1,
+        "max_retries": 3,
+        "dead_letter_queue": "cf-activity-observatory-dlq"
+      }
+    ]
+  },
+  "triggers": {
+    "crons": ["* * * * *"]
+  },
+  "assets": {
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 0.1,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 0.1,
+      "invocation_logs": true
+    }
+  }
+}
