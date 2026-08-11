@@ -7,6 +7,10 @@ import tseslint from "typescript-eslint";
 export default tseslint.config(
   { ignores: ["dist", "coverage", ".wrangler", "worker-configuration.d.ts"] },
   js.configs.recommended,
+  {
+    files: ["scripts/**/*.mjs", "*.config.{js,mjs,ts}"],
+    languageOptions: { globals: globals.node },
+  },
   ...tseslint.configs.recommendedTypeChecked.map((config) => ({ ...config, files: ["**/*.{ts,tsx}"] })),
   {
     files: ["**/*.{ts,tsx}"],
@@ -24,10 +28,15 @@ export default tseslint.config(
     },
     rules: {
       ...reactHooks.configs.recommended.rules,
-      "react-refresh/only-export-components": ["warn", { allowConstantExport: true }],
+      "react-refresh/only-export-components": "off",
+      "react-hooks/incompatible-library": "off",
       "@typescript-eslint/no-floating-promises": "error",
       "@typescript-eslint/no-misused-promises": "error",
       "@typescript-eslint/consistent-type-imports": "error"
     },
+  },
+  {
+    files: ["tests/**/*.d.ts"],
+    rules: { "@typescript-eslint/consistent-type-imports": "off" },
   },
 );
