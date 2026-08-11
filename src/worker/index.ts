@@ -43,6 +43,17 @@ export default {
         message.ack();
       } catch (error) {
         console.error(JSON.stringify({ event: "queue_job_failed", jobId: parsed.data.id, error: sanitizeError(error) }));
+        if (message.attempts >= 3) {
+          const timestamp = Date.now();
+          await env.DB.prepare(
+            `INSERT INTO alert_state (alert_key, status, first_seen_at, last_seen_at, details)
+             VALUES (?, 'active', ?, ?, ?)
+             ON CONFLICT(alert_key) DO UPDATE SET status = 'active', last_seen_at = excluded.last_seen_at,
+              details = excluded.details`,
+          )
+            .bind(`dlq:${parsed.data.id}`, timestamp, timestamp, JSON.stringify({ jobType: parsed.data.type, error: sanitizeError(error) }))
+            .run();
+        }
         message.retry({ delaySeconds: retryDelay(error, message.attempts) });
       }
     }

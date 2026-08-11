@@ -54,6 +54,23 @@ export async function dispatchScheduled(env: Env, scheduledAt = nowMs()): Promis
       if (!capability?.enabled) continue;
       const acquired = await acquireWindow(env, zone.id, dataset, capability, scheduledAt);
       if (!acquired) continue;
+      if (acquired.mode === "backfill") {
+        const liveEnd = floorTo(scheduledAt - DATA_DELAY_MS, MINUTE_MS);
+        const liveStart = Math.max(liveEnd - zone.poll_interval_minutes * MINUTE_MS, acquired.end);
+        if (liveStart < liveEnd) {
+          await env.COLLECTOR_QUEUE.send({
+            version: 1,
+            type: "collect",
+            id: crypto.randomUUID(),
+            zoneId: zone.id,
+            dataset,
+            start: liveStart,
+            end: liveEnd,
+            mode: "repair",
+          });
+          sent += 1;
+        }
+      }
       const job: CollectorJob = {
         version: 1,
         type: "collect",

@@ -215,6 +215,7 @@ interface ListFilterInput {
   path?: string;
   query?: string;
   method?: string;
+  protocol?: string;
   status?: number;
   cacheStatus?: string;
   securityAction?: string;
@@ -222,6 +223,7 @@ interface ListFilterInput {
   rayId?: string;
   userAgent?: string;
   requestSource?: string;
+  ruleId?: string;
 }
 
 function buildWhere(
@@ -232,6 +234,8 @@ function buildWhere(
     requestSource?: string;
     status?: string;
     cacheStatus?: string;
+    protocol?: string;
+    ruleId?: string;
   },
 ): { sql: string; bindings: unknown[] } {
   const conditions = ["occurred_at >= ?", "occurred_at < ?"];
@@ -250,12 +254,14 @@ function buildWhere(
     [input.country, "country"],
     [input.asn, "asn"],
     [input.method, "method"],
+    [input.protocol, columns.protocol ?? ""],
     [input.status, columns.status ?? ""],
     [input.cacheStatus, columns.cacheStatus ?? ""],
     [input.securityAction, columns.action],
     [input.securitySource, columns.source],
     [input.rayId, "ray_id"],
     [input.requestSource, columns.requestSource ?? ""],
+    [input.ruleId, columns.ruleId ?? ""],
   ];
   for (const [value, column] of equals) {
     if (value !== undefined && column) {
@@ -297,6 +303,8 @@ export async function listRequests(database: D1Database, input: ListFilterInput)
     requestSource: "request_source",
     status: "edge_status",
     cacheStatus: "cache_status",
+    protocol: "protocol",
+    ruleId: "security_rule_id",
   });
   const result = await database
     .prepare(`SELECT * FROM request_samples WHERE ${where.sql} ORDER BY occurred_at DESC, id DESC LIMIT ?`)
@@ -321,7 +329,7 @@ export async function listSecurityEvents(
   database: D1Database,
   input: ListFilterInput,
 ): Promise<PaginatedResult<SecurityEvent>> {
-  const where = buildWhere(input, { action: "action", source: "source" });
+  const where = buildWhere(input, { action: "action", source: "source", ruleId: "rule_id" });
   const result = await database
     .prepare(`SELECT * FROM security_events WHERE ${where.sql} ORDER BY occurred_at DESC, id DESC LIMIT ?`)
     .bind(...where.bindings, input.limit + 1)
@@ -450,7 +458,7 @@ interface UsageRow {
 }
 
 export async function getHealth(database: D1Database, warningBytes: number): Promise<CollectorHealth> {
-  const [cursorResult, gapResult, usage] = await Promise.all([
+  const [cursorResult, gapResult, usage, dlq] = await Promise.all([
     database
       .prepare(
         `SELECT c.zone_id, z.name AS zone_name, c.dataset, c.cursor_at, c.last_success_at,
@@ -472,6 +480,8 @@ export async function getHealth(database: D1Database, warningBytes: number): Pro
       )
       .bind(dayKey())
       .first<UsageRow>(),
+    database.prepare("SELECT COUNT(*) AS count FROM alert_state WHERE alert_key LIKE 'dlq:%' AND status = 'active'")
+      .first<{ count: number }>(),
   ]);
   const cursorDatasets = new Set(DATASETS);
   const cursors = cursorResult.results.flatMap((row) => {
@@ -513,7 +523,7 @@ export async function getHealth(database: D1Database, warningBytes: number): Pro
     r2BytesWritten: usage?.r2_bytes_written ?? 0,
   };
   const configured = cursors.length > 0;
-  const degraded = gaps.length > 0 || cursors.some((cursor) => cursor.consecutiveFailures >= 3);
+  const degraded = gaps.length > 0 || (dlq?.count ?? 0) > 0 || cursors.some((cursor) => cursor.consecutiveFailures >= 3);
   return {
     status: !configured ? "unconfigured" : degraded ? "degraded" : "healthy",
     now: nowMs(),
@@ -521,6 +531,7 @@ export async function getHealth(database: D1Database, warningBytes: number): Pro
     usageToday,
     cursors,
     gaps,
+    dlqJobs: dlq?.count ?? 0,
   };
 }
 
@@ -544,6 +555,7 @@ export function filtersFromUrl(url: URL): ListFilterInput {
     path: url.searchParams.get("path") ?? undefined,
     query: url.searchParams.get("query") ?? undefined,
     method: url.searchParams.get("method") ?? undefined,
+    protocol: url.searchParams.get("protocol") ?? undefined,
     status: statusValue && Number.isFinite(Number(statusValue)) ? Number(statusValue) : undefined,
     cacheStatus: url.searchParams.get("cacheStatus") ?? undefined,
     securityAction: url.searchParams.get("securityAction") ?? undefined,
@@ -551,5 +563,6 @@ export function filtersFromUrl(url: URL): ListFilterInput {
     rayId: url.searchParams.get("rayId") ?? undefined,
     userAgent: url.searchParams.get("userAgent") ?? undefined,
     requestSource: url.searchParams.get("requestSource") ?? undefined,
+    ruleId: url.searchParams.get("ruleId") ?? undefined,
   };
 }

@@ -224,4 +224,5 @@ export interface CollectorHealth {
     rangeEnd: number;
     reason: string;
   }>;
+  dlqJobs: number;
 }

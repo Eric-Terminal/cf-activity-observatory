@@ -250,6 +250,31 @@ async function rollupMetrics(database: D1Database, timestamp: number): Promise<v
   await database.prepare("DELETE FROM metric_buckets WHERE bucket_seconds = 3600 AND bucket_start < ?")
     .bind(timestamp - 730 * DAY_MS)
     .run();
+  await trimHighCardinality(database, 3600, 100);
+  await trimHighCardinality(database, 86400, 100);
+  await database.prepare(
+    `DELETE FROM metric_buckets WHERE bucket_seconds = 300 AND dimension_type IS NOT NULL AND bucket_start < ?`,
+  )
+    .bind(hourCutoff)
+    .run();
+}
+
+async function trimHighCardinality(database: D1Database, bucketSeconds: number, defaultLimit: number): Promise<void> {
+  await database.prepare(
+    `DELETE FROM metric_buckets WHERE id IN (
+       SELECT id FROM (
+         SELECT id, dimension_type,
+          ROW_NUMBER() OVER (
+            PARTITION BY zone_id, bucket_start, metric_kind, dimension_type
+            ORDER BY estimated_count DESC, dimension_value ASC
+          ) AS rank
+         FROM metric_buckets WHERE bucket_seconds = ? AND dimension_type IS NOT NULL
+       ) ranked
+       WHERE rank > CASE WHEN dimension_type = 'userAgent' THEN 50 ELSE ? END
+     )`,
+  )
+    .bind(bucketSeconds, defaultLimit)
+    .run();
 }
 
 async function gzip(input: Uint8Array): Promise<Uint8Array> {
