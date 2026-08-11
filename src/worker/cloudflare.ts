@@ -26,6 +26,11 @@ export interface DatasetResult {
   saturated: boolean;
 }
 
+interface RankingSelection {
+  fields: string[];
+  dimensionType: "path" | "ip" | "asn" | "userAgent" | "rule";
+}
+
 export class CloudflareApiError extends Error {
   constructor(
     message: string,
@@ -64,10 +69,16 @@ export const PREFERRED_FIELDS: Record<DatasetName, string[]> = {
     "securitySource",
     "securityRuleID",
     "botManagementScore",
+    "botManagementScoreSrc",
     "botManagementScoreSrcName",
+    "botManagementTags",
     "botManagementVerifiedBot",
+    "verifiedBotCategory",
     "botManagementJA3Hash",
     "botManagementJA4",
+    "wafAttackScore",
+    "contentScanObjResults",
+    "leakedCredentialCheckResult",
     "sampleInterval",
   ],
   firewallEventsAdaptive: [
@@ -91,36 +102,37 @@ export const PREFERRED_FIELDS: Record<DatasetName, string[]> = {
   ],
   httpRequestsAdaptiveGroups: [
     "dimensions_datetimeFiveMinutes",
-    "dimensions_clientRequestHTTPHost",
-    "dimensions_clientCountryName",
-    "dimensions_clientRequestHTTPMethodName",
-    "dimensions_clientRequestHTTPProtocol",
-    "dimensions_edgeResponseStatus",
-    "dimensions_cacheStatus",
-    "dimensions_securityAction",
-    "dimensions_securitySource",
-    "dimensions_requestSource",
-    "sum_requests",
-    "sum_edgeResponseBytes",
-    "sum_visits",
-    "avg_sampleInterval",
-    "confidence_requests_estimate",
-    "confidence_requests_lower",
-    "confidence_requests_upper",
-    "confidence_requests_sampleSize",
-  ],
-  firewallEventsAdaptiveGroups: [
-    "dimensions_datetimeFiveMinutes",
-    "dimensions_action",
-    "dimensions_source",
-    "dimensions_ruleId",
-    "dimensions_description",
     "count",
     "avg_sampleInterval",
     "confidence_count_estimate",
     "confidence_count_lower",
     "confidence_count_upper",
     "confidence_count_sampleSize",
+    "dimensions_clientRequestHTTPHost",
+    "dimensions_clientCountryName",
+    "dimensions_clientRequestHTTPMethodName",
+    "dimensions_clientRequestHTTPProtocol",
+    "dimensions_edgeResponseStatus",
+    "dimensions_originResponseStatus",
+    "dimensions_cacheStatus",
+    "dimensions_securityAction",
+    "dimensions_securitySource",
+    "dimensions_requestSource",
+    "sum_edgeResponseBytes",
+    "sum_visits",
+  ],
+  firewallEventsAdaptiveGroups: [
+    "dimensions_datetimeFiveMinutes",
+    "count",
+    "avg_sampleInterval",
+    "confidence_count_estimate",
+    "confidence_count_lower",
+    "confidence_count_upper",
+    "confidence_count_sampleSize",
+    "dimensions_action",
+    "dimensions_source",
+    "dimensions_ruleId",
+    "dimensions_description",
   ],
 };
 
@@ -220,11 +232,14 @@ export async function fetchDatasetWindow(
   const configured = Number(env.SAFE_PAGE_SIZE);
   const safeLimit = Number.isFinite(configured) ? configured : 250;
   const limit = Math.max(1, Math.min(capability.maxPageSize ?? safeLimit, safeLimit));
-  const selections = [fields, ...rankingSelections(capability)];
+  const selections: Array<{ fields: string[]; dimensionType: RankingSelection["dimensionType"] | null }> = [
+    { fields, dimensionType: null },
+    ...rankingSelections(capability),
+  ];
   const rows: Record<string, unknown>[] = [];
   let saturated = false;
   for (const selection of selections) {
-    const query = buildDatasetQuery(capability.dataset, selection, limit);
+    const query = buildDatasetQuery(capability.dataset, selection.fields, limit);
     const data = await graphql(env, query, {
       zoneTag: capability.zoneId,
       start: toIso(start),
@@ -232,7 +247,10 @@ export async function fetchDatasetWindow(
     });
     const result = firstZoneNode(data, capability.dataset);
     if (Array.isArray(result)) {
-      rows.push(...result.map(asRecord));
+      rows.push(...result.map((value) => ({
+        ...asRecord(value),
+        ...(selection.dimensionType ? { __observatoryDimensionType: selection.dimensionType } : {}),
+      })));
       saturated ||= result.length >= limit;
     }
   }
@@ -284,19 +302,20 @@ function nestedSelection(fields: string[]): string {
 }
 
 /** 高基数维度必须拆成独立 cube，否则路径、IP 与 UA 的笛卡尔组合会迅速耗尽页大小。 */
-function rankingSelections(capability: DatasetCapability): string[][] {
+function rankingSelections(capability: DatasetCapability): RankingSelection[] {
   if (!GROUP_DATASETS.includes(capability.dataset as (typeof GROUP_DATASETS)[number])) return [];
   const available = new Set(capability.availableFields);
   const permitted = (field: string) => available.size === 0 || available.has(field);
   const time = permitted("dimensions_datetimeFiveMinutes") ? "dimensions_datetimeFiveMinutes" : null;
-  const count = capability.dataset === "httpRequestsAdaptiveGroups"
-    ? permitted("sum_requests") ? "sum_requests" : null
-    : permitted("count") ? "count" : null;
+  const count = permitted("count") ? "count" : null;
   if (!time || !count) return [];
-  const dimensions = capability.dataset === "httpRequestsAdaptiveGroups"
-    ? ["dimensions_clientRequestPath", "dimensions_clientIP", "dimensions_clientASN", "dimensions_userAgent"]
-    : ["dimensions_ruleId"];
-  return dimensions.filter(permitted).map((dimension) => [time, dimension, count, ...(permitted("avg_sampleInterval") ? ["avg_sampleInterval"] : [])]);
+  const dimensions: Array<[string, RankingSelection["dimensionType"]]> = capability.dataset === "httpRequestsAdaptiveGroups"
+    ? [["dimensions_clientRequestPath", "path"], ["dimensions_clientIP", "ip"], ["dimensions_clientASN", "asn"], ["dimensions_userAgent", "userAgent"]]
+    : [["dimensions_ruleId", "rule"]];
+  return dimensions.filter(([dimension]) => permitted(dimension)).map(([dimension, dimensionType]) => ({
+    fields: [time, dimension, count, ...(permitted("avg_sampleInterval") ? ["avg_sampleInterval"] : [])],
+    dimensionType,
+  }));
 }
 
 function firstZoneNode(data: Record<string, unknown>, key: string): unknown {

@@ -317,23 +317,24 @@ async function queryMetrics(database: D1Database, url: URL): Promise<{ bucketSec
   const zones = parseCsv(url.searchParams.get("zones") ?? undefined);
   const kind = url.searchParams.get("kind") === "security" ? "security" : "http";
   const dimension = url.searchParams.get("dimension") ?? "total";
+  const highCardinality = ["path", "ip", "asn", "userAgent", "rule"].includes(dimension);
   const columns: Record<string, string> = {
     total: "''",
     country: "country",
     host: "host",
-    asn: "CAST(asn AS TEXT)",
     method: "method",
     protocol: "protocol",
     status: "CAST(edge_status AS TEXT)",
+    originStatus: "CAST(origin_status AS TEXT)",
     cache: "cache_status",
     securityAction: "security_action",
     securitySource: "security_source",
     requestSource: "request_source",
   };
   let dimensionSql = columns[dimension];
-  let dimensionFilter = "";
+  let dimensionFilter = " AND dimension_type IS NULL";
   const bindings: unknown[] = [kind, from, to];
-  if (!dimensionSql && ["path", "ip", "userAgent", "rule"].includes(dimension)) {
+  if (!dimensionSql && highCardinality) {
     dimensionSql = "dimension_value";
     dimensionFilter = " AND dimension_type = ?";
     bindings.push(dimension);
@@ -342,7 +343,7 @@ async function queryMetrics(database: D1Database, url: URL): Promise<{ bucketSec
   const requestedBucket = Number(url.searchParams.get("bucket"));
   const bucketSeconds = [300, 3600, 86400].includes(requestedBucket)
     ? requestedBucket
-    : to - from <= 7 * 86_400_000 ? 300 : to - from <= 180 * 86_400_000 ? 3600 : 86400;
+    : highCardinality ? 3600 : to - from <= 7 * 86_400_000 ? 300 : to - from <= 180 * 86_400_000 ? 3600 : 86400;
   let zoneFilter = "";
   if (zones.length) {
     zoneFilter = ` AND zone_id IN (${zones.map(() => "?").join(",")})`;

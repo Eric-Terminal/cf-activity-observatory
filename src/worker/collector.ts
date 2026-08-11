@@ -201,9 +201,32 @@ async function acquireWindow(
   )
     .bind(zoneId, dataset)
     .first<{ cursor_at: number; in_flight_until: number | null }>();
-  if (!cursor || (cursor.in_flight_until && cursor.in_flight_until > timestamp) || cursor.cursor_at >= stableEnd) return null;
+  if (!cursor || (cursor.in_flight_until && cursor.in_flight_until > timestamp)) return null;
+  let cursorAt = cursor.cursor_at;
+  if (cursorAt < oldest) {
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT OR IGNORE INTO data_gaps
+         (id, zone_id, dataset, range_start, range_end, reason, detected_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ).bind(
+        stableId(zoneId, dataset, cursorAt, oldest, "retention"),
+        zoneId,
+        dataset,
+        cursorAt,
+        oldest,
+        "停机区间已超出 Cloudflare 当前数据集可回看窗口",
+        timestamp,
+      ),
+      env.DB.prepare(
+        "UPDATE sync_cursors SET cursor_at = ?, updated_at = ? WHERE zone_id = ? AND dataset = ?",
+      ).bind(oldest, timestamp, zoneId, dataset),
+    ]);
+    cursorAt = oldest;
+  }
+  if (cursorAt >= stableEnd) return null;
   const maxDuration = Math.max(MINUTE_MS, (capability.maxDuration ?? 300) * 1000);
-  const end = Math.min(cursor.cursor_at + maxDuration, stableEnd);
+  const end = Math.min(cursorAt + maxDuration, stableEnd);
   const acquired = await env.DB.prepare(
     `UPDATE sync_cursors SET in_flight_until = ?, updated_at = ?
      WHERE zone_id = ? AND dataset = ? AND (in_flight_until IS NULL OR in_flight_until <= ?)`,
@@ -211,7 +234,7 @@ async function acquireWindow(
     .bind(timestamp + 15 * MINUTE_MS, timestamp, zoneId, dataset, timestamp)
     .run();
   if (!acquired.meta.changes) return null;
-  return { start: cursor.cursor_at, end, mode: end < stableEnd ? "backfill" : "realtime" };
+  return { start: cursorAt, end, mode: end < stableEnd ? "backfill" : "realtime" };
 }
 
 async function collectWindow(
@@ -287,7 +310,9 @@ function requestStatement(database: D1Database, zoneId: string, row: Record<stri
     "clientRefererHost", "clientDeviceType", "clientRequestHTTPHost", "clientRequestPath", "clientRequestQuery",
     "clientRequestHTTPMethodName", "clientRequestHTTPProtocol", "requestSource", "coloCode", "cacheStatus",
     "originResponseStatus", "edgeResponseStatus", "securityAction", "securitySource", "securityRuleID",
-    "botManagementScore", "botManagementScoreSrcName", "botManagementVerifiedBot", "sampleInterval",
+    "botManagementScore", "botManagementScoreSrc", "botManagementScoreSrcName", "botManagementTags",
+    "botManagementVerifiedBot", "verifiedBotCategory", "wafAttackScore", "contentScanObjResults",
+    "leakedCredentialCheckResult", "sampleInterval",
   ]);
   return database.prepare(
     `INSERT OR IGNORE INTO request_samples
@@ -304,9 +329,9 @@ function requestStatement(database: D1Database, zoneId: string, row: Record<stri
     asString(row.clientRequestHTTPMethodName), asString(row.clientRequestHTTPProtocol), asString(row.requestSource),
     asString(row.coloCode), asString(row.cacheStatus), asNumber(row.originResponseStatus), asNumber(row.edgeResponseStatus),
     asString(row.securityAction), asString(row.securitySource), asString(row.securityRuleID), asNumber(row.botManagementScore),
-    asString(row.botManagementScoreSrcName), JSON.stringify(row.botManagementTags ?? []),
-    row.botManagementVerifiedBot === true ? "verified" : asString(row.verifiedBotCategory), asNumber(row.attackScore),
-    JSON.stringify(row.contentScanResult ?? null), asString(row.leakedCredentialResult), asNumber(row.sampleInterval),
+    asString(row.botManagementScoreSrc ?? row.botManagementScoreSrcName), JSON.stringify(row.botManagementTags ?? []),
+    row.botManagementVerifiedBot === true ? "verified" : asString(row.verifiedBotCategory), asNumber(row.wafAttackScore),
+    JSON.stringify(row.contentScanObjResults ?? null), asString(row.leakedCredentialCheckResult), asNumber(row.sampleInterval),
     nowMs(), batchId, JSON.stringify(remaining(row, known)),
   );
 }
@@ -345,14 +370,15 @@ function metricStatement(database: D1Database, dataset: DatasetName, zoneId: str
   const metricKind = dataset === "httpRequestsAdaptiveGroups" ? "http" : "security";
   const signature = canonicalJson(dimensions);
   const id = stableId(zoneId, bucketStart, bucketSeconds, metricKind, signature);
-  const estimated = asNumber(sum.requests ?? row.count ?? confidenceMetric.estimate) ?? 0;
+  const estimated = asNumber(row.count ?? confidenceMetric.estimate) ?? 0;
+  const dimensionType = asString(row.__observatoryDimensionType);
   return database.prepare(
     `INSERT INTO metric_buckets
      (id, zone_id, bucket_start, bucket_seconds, metric_kind, dimension_signature, host, country, asn,
-      method, protocol, edge_status, status_class, cache_status, security_action, security_source, request_source,
+      method, protocol, edge_status, origin_status, status_class, cache_status, security_action, security_source, request_source,
       dimension_type, dimension_value, estimated_count, sample_interval, confidence_estimate, confidence_lower,
       confidence_upper, confidence_sample_size, edge_response_bytes, visits, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(zone_id, bucket_start, bucket_seconds, metric_kind, dimension_signature) DO UPDATE SET
       estimated_count = excluded.estimated_count, sample_interval = excluded.sample_interval,
       confidence_estimate = excluded.confidence_estimate, confidence_lower = excluded.confidence_lower,
@@ -362,23 +388,19 @@ function metricStatement(database: D1Database, dataset: DatasetName, zoneId: str
     id, zoneId, bucketStart, bucketSeconds, metricKind, signature, asString(dimensions.clientRequestHTTPHost),
     asString(dimensions.clientCountryName), asNumber(dimensions.clientASN), asString(dimensions.clientRequestHTTPMethodName),
     asString(dimensions.clientRequestHTTPProtocol), asNumber(dimensions.edgeResponseStatus),
+    asNumber(dimensions.originResponseStatus),
     statusClass(asNumber(dimensions.edgeResponseStatus)), asString(dimensions.cacheStatus),
     asString(dimensions.securityAction ?? dimensions.action), asString(dimensions.securitySource ?? dimensions.source),
-    asString(dimensions.requestSource), rankingDimension(dimensions)?.type ?? null, rankingDimension(dimensions)?.value ?? null,
+    asString(dimensions.requestSource), dimensionType, rankingValue(dimensions, dimensionType),
     estimated, asNumber(average.sampleInterval), asNumber(confidenceMetric.estimate), asNumber(confidenceMetric.lower),
     asNumber(confidenceMetric.upper), asNumber(confidenceMetric.sampleSize), asNumber(sum.edgeResponseBytes), asNumber(sum.visits), nowMs(),
   );
 }
 
-function rankingDimension(dimensions: Record<string, unknown>): { type: string; value: string } | null {
-  for (const [field, type] of [
-    ["clientRequestPath", "path"], ["clientIP", "ip"], ["clientASN", "asn"], ["userAgent", "userAgent"],
-    ["ruleId", "rule"],
-  ] as const) {
-    const value = dimensions[field];
-    if (typeof value === "string" || typeof value === "number") return { type, value: String(value) };
-  }
-  return null;
+function rankingValue(dimensions: Record<string, unknown>, type: string | null): string | null {
+  const field = { path: "clientRequestPath", ip: "clientIP", asn: "clientASN", userAgent: "userAgent", rule: "ruleId" }[type ?? ""];
+  const value = field ? dimensions[field] : null;
+  return typeof value === "string" || typeof value === "number" ? String(value) : null;
 }
 
 function statusClass(status: number | null): number | null {

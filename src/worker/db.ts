@@ -539,6 +539,9 @@ export function filtersFromUrl(url: URL): ListFilterInput {
   const from = Date.parse(url.searchParams.get("from") ?? new Date(nowMs() - 86_400_000).toISOString());
   const to = Date.parse(url.searchParams.get("to") ?? new Date().toISOString());
   if (!Number.isFinite(from) || !Number.isFinite(to) || from >= to) throw new Error("时间范围无效");
+  if ((url.searchParams.has("query") || url.searchParams.has("userAgent")) && to - from > 31 * 86_400_000) {
+    throw new Error("查询字符串和 User-Agent 的包含搜索最多支持 31 天范围");
+  }
   const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? 100), 1), 500);
   const asnValue = url.searchParams.get("asn");
   const statusValue = url.searchParams.get("status");

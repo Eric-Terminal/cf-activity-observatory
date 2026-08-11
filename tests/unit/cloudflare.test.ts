@@ -26,11 +26,11 @@ describe("Cloudflare GraphQL 查询构建", () => {
   });
 
   it("把 Groups 能力字段还原为嵌套选择集", () => {
-    const query = buildDatasetQuery("httpRequestsAdaptiveGroups", ["dimensions_datetimeFiveMinutes", "sum_requests", "avg_sampleInterval", "confidence_requests_lower"], 250);
+    const query = buildDatasetQuery("httpRequestsAdaptiveGroups", ["dimensions_datetimeFiveMinutes", "count", "avg_sampleInterval", "confidence_count_lower"], 250);
     expect(query).toContain("dimensions { datetimeFiveMinutes }");
-    expect(query).toContain("sum { requests }");
+    expect(query).toContain("count");
     expect(query).toContain("avg { sampleInterval }");
-    expect(query).toContain("confidence(level: 0.95) { requests { lower } }");
+    expect(query).toContain("confidence(level: 0.95) { count { lower } }");
     expect(query).toContain("orderBy: [datetimeFiveMinutes_DESC]");
   });
 });

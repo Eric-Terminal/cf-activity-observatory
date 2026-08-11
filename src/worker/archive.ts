@@ -61,7 +61,7 @@ export async function getArchive(database: D1Database, id: string): Promise<Arch
 }
 
 async function findArchiveCandidates(database: D1Database, timestamp: number): Promise<ArchiveCandidate[]> {
-  const completeHour = floorTo(timestamp, HOUR_MS) - HOUR_MS;
+  const completeHour = floorTo(timestamp, HOUR_MS);
   const requests = await database.prepare(
     `WITH hours AS (
        SELECT zone_id, CAST(occurred_at / 3600000 AS INTEGER) * 3600000 AS hour_start
@@ -171,7 +171,7 @@ async function pruneArchivedDetails(env: Env, timestamp: number): Promise<void> 
   const overWaterline = (d1Size?.size ?? 0) >= Number(env.D1_WARNING_BYTES);
   for (const zone of zones.results) {
     const cutoff = overWaterline
-      ? floorTo(timestamp - 7 * DAY_MS, HOUR_MS)
+      ? floorTo(timestamp, HOUR_MS)
       : floorTo(timestamp - zone.detail_retention_days * DAY_MS, HOUR_MS);
     for (const [dataset, table] of [
       ["httpRequestsAdaptive", "request_samples"],
@@ -199,17 +199,17 @@ async function pruneArchivedDetails(env: Env, timestamp: number): Promise<void> 
 }
 
 async function rollupMetrics(database: D1Database, timestamp: number): Promise<void> {
-  const hourCutoff = floorTo(timestamp, HOUR_MS) - HOUR_MS;
-  const dayCutoff = floorTo(timestamp, DAY_MS) - DAY_MS;
+  const hourCutoff = floorTo(timestamp, HOUR_MS);
+  const dayCutoff = floorTo(timestamp, DAY_MS);
   await database.prepare(
     `INSERT INTO metric_buckets
      (id, zone_id, bucket_start, bucket_seconds, metric_kind, dimension_signature, host, country, asn,
-      method, protocol, edge_status, status_class, cache_status, security_action, security_source, request_source,
+      method, protocol, edge_status, origin_status, status_class, cache_status, security_action, security_source, request_source,
       dimension_type, dimension_value, estimated_count, sample_interval, confidence_estimate, confidence_lower,
       confidence_upper, confidence_sample_size, edge_response_bytes, visits, updated_at)
      SELECT 'h:' || zone_id || ':' || CAST(bucket_start / 3600000 AS INTEGER) || ':' || metric_kind || ':' || dimension_signature,
       zone_id, CAST(bucket_start / 3600000 AS INTEGER) * 3600000, 3600, metric_kind, dimension_signature,
-      host, country, asn, method, protocol, edge_status, status_class, cache_status, security_action, security_source,
+      host, country, asn, method, protocol, edge_status, origin_status, status_class, cache_status, security_action, security_source,
       request_source, dimension_type, dimension_value, SUM(estimated_count), AVG(sample_interval),
       SUM(confidence_estimate), SUM(confidence_lower), SUM(confidence_upper), SUM(confidence_sample_size),
       SUM(edge_response_bytes), SUM(visits), ?
@@ -224,12 +224,12 @@ async function rollupMetrics(database: D1Database, timestamp: number): Promise<v
   await database.prepare(
     `INSERT INTO metric_buckets
      (id, zone_id, bucket_start, bucket_seconds, metric_kind, dimension_signature, host, country, asn,
-      method, protocol, edge_status, status_class, cache_status, security_action, security_source, request_source,
+      method, protocol, edge_status, origin_status, status_class, cache_status, security_action, security_source, request_source,
       dimension_type, dimension_value, estimated_count, sample_interval, confidence_estimate, confidence_lower,
       confidence_upper, confidence_sample_size, edge_response_bytes, visits, updated_at)
      SELECT 'd:' || zone_id || ':' || CAST(bucket_start / 86400000 AS INTEGER) || ':' || metric_kind || ':' || dimension_signature,
       zone_id, CAST(bucket_start / 86400000 AS INTEGER) * 86400000, 86400, metric_kind, dimension_signature,
-      host, country, asn, method, protocol, edge_status, status_class, cache_status, security_action, security_source,
+      host, country, asn, method, protocol, edge_status, origin_status, status_class, cache_status, security_action, security_source,
       request_source, dimension_type, dimension_value, SUM(estimated_count), AVG(sample_interval),
       SUM(confidence_estimate), SUM(confidence_lower), SUM(confidence_upper), SUM(confidence_sample_size),
       SUM(edge_response_bytes), SUM(visits), ?

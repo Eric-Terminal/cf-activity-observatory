@@ -61,12 +61,18 @@ export async function evaluateAlerts(env: Env): Promise<void> {
   if (Number(usage?.d1_size_after ?? 0) >= Number(env.D1_WARNING_BYTES)) {
     active.set("storage:d1", { title: "D1 存储达到安全水位", details: "系统将优先归档并清理最旧的完整小时。" });
   }
+  if (Number(usage?.queue_messages ?? 0) >= 8_000) {
+    active.set("budget:queue", { title: "Queue 每日安全预算已用尽", details: "当日 Queue 操作估算已达到预留 20% 后的安全水位。" });
+  }
   for (const [key, alert] of active) await transitionAlert(env, key, true, alert.title, alert.details, timestamp);
 
   const open = await env.DB.prepare("SELECT alert_key FROM alert_state WHERE status = 'active'")
     .all<{ alert_key: string }>();
   for (const state of open.results) {
-    if (!active.has(state.alert_key)) await transitionAlert(env, state.alert_key, false, "状态已恢复", state.alert_key, timestamp);
+    // DLQ 没有可靠的自动清空信号；保留状态，直到运维确认并显式处理对应记录。
+    if (!state.alert_key.startsWith("dlq:") && !active.has(state.alert_key)) {
+      await transitionAlert(env, state.alert_key, false, "状态已恢复", state.alert_key, timestamp);
+    }
   }
 }
 

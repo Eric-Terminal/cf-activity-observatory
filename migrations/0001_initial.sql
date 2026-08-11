@@ -130,6 +130,7 @@ CREATE TABLE metric_buckets (
   method TEXT,
   protocol TEXT,
   edge_status INTEGER,
+  origin_status INTEGER,
   status_class INTEGER,
   cache_status TEXT,
   security_action TEXT,
@@ -262,4 +263,3 @@ CREATE TABLE alert_state (
   recovered_at INTEGER,
   details TEXT NOT NULL DEFAULT '{}'
 );
-

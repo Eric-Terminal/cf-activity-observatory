@@ -2,13 +2,23 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { env, exports } from "cloudflare:workers";
 import { processCollectJob, retryDelay } from "@/worker/collector";
 import { runMaintenance } from "@/worker/archive";
-import { csvCell } from "@/worker/api";
+import { csvCell, estimateDailyQueueOperations } from "@/worker/api";
 import { dotStuff, mimeMessage } from "@/worker/smtp";
 import { CloudflareApiError } from "@/worker/cloudflare";
 
 afterEach(() => vi.unstubAllGlobals());
 
 describe("Worker API 与存储", () => {
+  it("公网请求没有 Access JWT 时拒绝访问", async () => {
+    const response = await exports.default.fetch("https://observatory.example/api/v1/health");
+    expect(response.status).toBe(401);
+  });
+
+  it("状态修改请求缺少同源 Origin 时拒绝执行", async () => {
+    const response = await exports.default.fetch("http://localhost/api/v1/zones/discover", { method: "POST" });
+    expect(response.status).toBe(403);
+  });
+
   it("未配置时健康端点可用且不会绕过 API 身份逻辑", async () => {
     const response = await exports.default.fetch("http://localhost/api/v1/health");
     expect(response.status).toBe(200);
@@ -52,6 +62,55 @@ describe("Worker API 与存储", () => {
     expect(count?.count).toBe(1);
   });
 
+  it("聚合总量不会重复计入高基数排名 cube", async () => {
+    const timestamp = Math.floor((Date.now() - 3 * 3_600_000) / 300_000) * 300_000;
+    await insertZone("zone-metrics", "metrics.example");
+    await env.DB.prepare(
+      `INSERT INTO dataset_capabilities
+       (zone_id, dataset, enabled, available_fields, max_page_size, max_number_of_fields, not_older_than, max_duration, checked_at)
+       VALUES ('zone-metrics', 'httpRequestsAdaptiveGroups', 1,
+        '["dimensions_datetimeFiveMinutes","dimensions_clientRequestHTTPHost","dimensions_clientRequestPath","count","avg_sampleInterval"]',
+        1000, 10, 604800, 86400, ?)`,
+    ).bind(Date.now()).run();
+    vi.stubGlobal("fetch", vi.fn().mockImplementation((_input, init?: RequestInit) => {
+      if (typeof init?.body !== "string") throw new Error("GraphQL 测试请求缺少 JSON body");
+      const query = JSON.parse(init.body) as { query: string };
+      const dimensions = query.query.includes("clientRequestPath")
+        ? { datetimeFiveMinutes: new Date(timestamp).toISOString(), clientRequestPath: "/ranked" }
+        : { datetimeFiveMinutes: new Date(timestamp).toISOString(), clientRequestHTTPHost: "metrics.example" };
+      return Promise.resolve(new Response(JSON.stringify({
+        data: { viewer: { zones: [{ httpRequestsAdaptiveGroups: [{ dimensions, count: 10, avg: { sampleInterval: 1 } }] }] } },
+      }), { headers: { "Content-Type": "application/json" } }));
+    }));
+    await processCollectJob(env, {
+      version: 1,
+      type: "collect",
+      id: "collect-metrics",
+      zoneId: "zone-metrics",
+      dataset: "httpRequestsAdaptiveGroups",
+      start: timestamp,
+      end: timestamp + 300_000,
+      mode: "repair",
+    });
+    const stored = await env.DB.prepare(
+      "SELECT dimension_type, dimension_value FROM metric_buckets WHERE zone_id = 'zone-metrics' AND bucket_seconds = 300 ORDER BY dimension_type",
+    ).all<{ dimension_type: string | null; dimension_value: string | null }>();
+    expect(stored.results).toEqual([
+      { dimension_type: null, dimension_value: null },
+      { dimension_type: "path", dimension_value: "/ranked" },
+    ]);
+    await runMaintenance(env);
+
+    const range = `from=${encodeURIComponent(new Date(timestamp - 3_600_000).toISOString())}&to=${encodeURIComponent(new Date(timestamp + 3_600_000).toISOString())}`;
+    const totalResponse = await exports.default.fetch(`http://localhost/api/v1/metrics?kind=http&dimension=total&${range}`);
+    const total = await totalResponse.json<{ series: Array<{ points: Array<{ estimated_count: number }> }> }>();
+    expect(total.series[0]?.points[0]?.estimated_count).toBe(10);
+    const pathResponse = await exports.default.fetch(`http://localhost/api/v1/metrics?kind=http&dimension=path&${range}`);
+    const paths = await pathResponse.json<{ bucketSeconds: number; series: Array<{ name: string }> }>();
+    expect(paths.bucketSeconds).toBe(3600);
+    expect(paths.series[0]?.name).toBe("/ranked");
+  });
+
   it("归档经 R2 校验后写入 verified manifest", async () => {
     const occurredAt = Math.floor((Date.now() - 3 * 3_600_000) / 3_600_000) * 3_600_000;
     await insertZone("zone-archive", "archive.example");
@@ -68,6 +127,10 @@ describe("Worker API 与存储", () => {
 });
 
 describe("安全边界与协议细节", () => {
+  it("Queue 预算估算包含四数据集实时任务和每小时修复", () => {
+    expect(estimateDailyQueueOperations([{ enabled: true, pollIntervalMinutes: 5 }])).toBe(3_744);
+    expect(estimateDailyQueueOperations([{ enabled: false, pollIntervalMinutes: 1 }])).toBe(0);
+  });
   it("阻止 CSV 公式注入", () => expect(csvCell("=WEBSERVICE(\"bad\")")).toBe("\"'=WEBSERVICE(\"\"bad\"\")\""));
   it("执行 SMTP dot stuffing 并生成标准 MIME", () => {
     expect(dotStuff("a\n.hidden\n..double")).toBe("a\r\n..hidden\r\n...double");
@@ -78,6 +141,10 @@ describe("安全边界与协议细节", () => {
   it("429 显式 Retry-After 优先于指数退避", () => {
     const error = new CloudflareApiError("rate", 75, 429);
     expect(retryDelay(error, 1)).toBe(75);
+  });
+  it("503 使用有上限的指数退避", () => {
+    expect(retryDelay(new CloudflareApiError("temporary", null, 503), 3)).toBe(120);
+    expect(retryDelay(new CloudflareApiError("temporary", null, 503), 20)).toBe(900);
   });
 });
 
