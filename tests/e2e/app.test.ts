@@ -13,7 +13,7 @@ test("总览明确区分校正趋势与采样明细", async ({ page }) => {
   await expect(page.getByRole("heading", { name: "总览" })).toBeVisible();
   await expect(page.getByText("采样校正趋势").first()).toBeVisible();
   await expect(page.getByText("明细是 Cloudflare 返回的真实请求样本")).toBeVisible();
-  await expect(page.locator(".metric-card")).toHaveCount(4);
+  await expect(page.locator(".metric-card")).toHaveCount(7);
 });
 
 test("请求筛选会同步到 URL，并可在刷新后恢复", async ({ page }) => {
@@ -42,7 +42,7 @@ function fixture(pathname: string): unknown {
   if (pathname.endsWith("/requests")) return { items: [], nextCursor: null };
   if (pathname.endsWith("/security-events")) return { items: [], nextCursor: null };
   if (pathname.endsWith("/archives")) return { items: [] };
-  if (pathname.endsWith("/health")) return { status: "unconfigured", now: Date.now(), d1WarningBytes: 419430400, usageToday: { graphqlQueries: 0, d1RowsRead: 0, d1RowsWritten: 0, d1SizeAfter: 0, queueMessages: 0, r2BytesWritten: 0 }, cursors: [], gaps: [] };
+  if (pathname.endsWith("/health")) return { status: "unconfigured", now: Date.now(), d1WarningBytes: 419430400, usageToday: { graphqlQueries: 0, d1RowsRead: 0, d1RowsWritten: 0, d1SizeAfter: 0, queueMessages: 0, r2BytesWritten: 0 }, cursors: [], gaps: [], dlqJobs: 0 };
   if (pathname.endsWith("/settings/smtp")) return { configured: false, enabled: false };
   if (pathname.endsWith("/settings")) return { d1WarningBytes: 419430400, estimatedDailyQueueOperations: 0, safeDailyQueueOperations: 8000, capabilities: [] };
   if (pathname.endsWith("/saved-views")) return { items: [] };

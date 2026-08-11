@@ -13,38 +13,57 @@ import { rangeDates, TimeControls, type RangeKey } from "@/client/components/Tim
 export function Overview() {
   const { t } = useI18n();
   const [range, setRange] = useState<RangeKey>("24h");
-  const [zone, setZone] = useState("");
+  const [selectedZones, setSelectedZones] = useState<string[]>([]);
   const dates = rangeDates(range);
+  const duration = Date.parse(dates.to) - Date.parse(dates.from);
+  const previousDates = { from: new Date(Date.parse(dates.from) - duration).toISOString(), to: dates.from };
   const zones = useQuery({ queryKey: ["zones"], queryFn: endpoints.zones });
-  const http = useMetric("http", "total", dates, zone);
-  const security = useMetric("security", "securityAction", dates, zone);
-  const countries = useMetric("http", "country", dates, zone);
-  const hosts = useMetric("http", "host", dates, zone);
-  const paths = useMetric("http", "path", dates, zone);
-  const ips = useMetric("http", "ip", dates, zone);
-  const asns = useMetric("http", "asn", dates, zone);
-  const userAgents = useMetric("http", "userAgent", dates, zone);
+  const http = useMetric("http", "total", dates, selectedZones);
+  const security = useMetric("security", "securityAction", dates, selectedZones);
+  const previousHttp = useMetric("http", "total", previousDates, selectedZones);
+  const previousSecurity = useMetric("security", "securityAction", previousDates, selectedZones);
+  const edgeStatuses = useMetric("http", "status", dates, selectedZones);
+  const originStatuses = useMetric("http", "originStatus", dates, selectedZones);
+  const cacheStatuses = useMetric("http", "cache", dates, selectedZones);
+  const countries = useMetric("http", "country", dates, selectedZones);
+  const hosts = useMetric("http", "host", dates, selectedZones);
+  const paths = useMetric("http", "path", dates, selectedZones);
+  const ips = useMetric("http", "ip", dates, selectedZones);
+  const asns = useMetric("http", "asn", dates, selectedZones);
+  const userAgents = useMetric("http", "userAgent", dates, selectedZones);
   const health = useQuery({ queryKey: ["health"], queryFn: endpoints.health, refetchInterval: 60_000 });
 
   const requestTotal = metricTotal(http.data);
   const mitigatedTotal = metricTotal(security.data);
+  const previousRequestTotal = metricTotal(previousHttp.data);
+  const previousMitigatedTotal = metricTotal(previousSecurity.data);
+  const edgeErrors = matchingMetricTotal(edgeStatuses.data, (name) => /^5\d\d$/.test(name));
+  const originResponses = matchingMetricTotal(originStatuses.data, (name) => /^\d{3}$/.test(name));
+  const originErrors = matchingMetricTotal(originStatuses.data, (name) => /^5\d\d$/.test(name));
+  const cacheResponses = metricTotal(cacheStatuses.data);
+  const cacheHits = matchingMetricTotal(cacheStatuses.data, (name) => /^(hit|stale|revalidated)$/i.test(name));
   const cards = [
-    [t("estimatedRequests"), formatNumber(requestTotal), "blue"],
-    [t("mitigatedRequests"), formatNumber(mitigatedTotal), "amber"],
-    [t("mitigationRate"), requestTotal ? `${((mitigatedTotal / requestTotal) * 100).toFixed(2)}%` : "—", "violet"],
-    [t("dataHealth"), t(health.data?.status ?? "unconfigured"), health.data?.status === "healthy" ? "green" : "red"],
+    [t("estimatedRequests"), formatNumber(requestTotal), "blue", periodDelta(requestTotal, previousRequestTotal, t("vsPrevious"))],
+    [t("mitigatedRequests"), formatNumber(mitigatedTotal), "amber", periodDelta(mitigatedTotal, previousMitigatedTotal, t("vsPrevious"))],
+    [t("mitigationRate"), requestTotal ? `${((mitigatedTotal / requestTotal) * 100).toFixed(2)}%` : "—", "violet", t("adjustedTrend")],
+    [t("edgeErrorRate"), requestTotal ? `${((edgeErrors / requestTotal) * 100).toFixed(2)}%` : "—", "red", t("adjustedTrend")],
+    [t("originErrorRate"), originResponses ? `${((originErrors / originResponses) * 100).toFixed(2)}%` : "—", "red", t("adjustedTrend")],
+    [t("cacheHitRate"), cacheResponses ? `${((cacheHits / cacheResponses) * 100).toFixed(2)}%` : "—", "green", t("adjustedTrend")],
+    [t("dataHealth"), t(health.data?.status ?? "unconfigured"), health.data?.status === "healthy" ? "green" : "red", `${health.data?.gaps.length ?? 0} ${t("gaps")}`],
   ];
-  const loading = http.isLoading || security.isLoading || countries.isLoading || hosts.isLoading || paths.isLoading || ips.isLoading || asns.isLoading || userAgents.isLoading;
-  const error = http.error ?? security.error ?? countries.error ?? hosts.error ?? paths.error ?? ips.error ?? asns.error ?? userAgents.error;
+  const loading = http.isLoading || security.isLoading || previousHttp.isLoading || previousSecurity.isLoading || edgeStatuses.isLoading || originStatuses.isLoading || cacheStatuses.isLoading || countries.isLoading || hosts.isLoading || paths.isLoading || ips.isLoading || asns.isLoading || userAgents.isLoading;
+  const error = http.error ?? security.error ?? previousHttp.error ?? previousSecurity.error ?? edgeStatuses.error ?? originStatuses.error ?? cacheStatuses.error ?? countries.error ?? hosts.error ?? paths.error ?? ips.error ?? asns.error ?? userAgents.error;
   return <>
-    <PageHeader title={t("overview")} eyebrow="CF Activity Observatory" actions={<><select aria-label={t("zone")} value={zone} onChange={(event) => setZone(event.target.value)}><option value="">{t("allZones")}</option>{zones.data?.zones.filter((item) => item.enabled).map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select><TimeControls range={range} setRange={setRange} /></>} />
+    <PageHeader title={t("overview")} eyebrow="CF Activity Observatory" actions={<><ZonePicker zones={zones.data?.zones.filter((item) => item.enabled) ?? []} selected={selectedZones} setSelected={setSelectedZones} /><TimeControls range={range} setRange={setRange} /></>} />
     <Notice><strong>{t("sampling")}</strong><span>{t("samplingHelp")}</span></Notice>
     {!zones.isLoading && !zones.data?.zones.length && <Notice tone="warning">{t("apiNotConfigured")}</Notice>}
-    <section className="metric-grid">{cards.map(([label, value, tone]) => <article className={`metric-card ${tone}`} key={label}><span>{label}</span><strong>{value}</strong><small>{label === t("dataHealth") ? `${health.data?.gaps.length ?? 0} ${t("gaps")}` : t("adjustedTrend")}</small></article>)}</section>
+    <section className="metric-grid">{cards.map(([label, value, tone, detail]) => <article className={`metric-card ${tone}`} key={label}><span>{label}</span><strong>{value}</strong><small>{detail}</small></article>)}</section>
     {loading ? <Loading /> : error ? <ErrorState error={error} /> : <div className="dashboard-grid">
-      <article className="panel span-2"><PanelTitle title={t("requestTrend")} badge={t("adjustedTrend")} /><Chart option={trendOption(http.data, security.data)} /></article>
+      <article className="panel span-2"><PanelTitle title={t("requestTrend")} badge={metricQuality(http.data, t("averageSampleInterval"), t("confidenceAvailable"))} /><Chart option={trendOption(http.data, security.data, t("estimatedRequests"), t("mitigatedRequests"))} /></article>
       <article className="panel"><PanelTitle title={t("securityActions")} badge={t("adjustedTrend")} /><Chart option={donutOption(security.data)} /></article>
       <article className="panel"><PanelTitle title={t("countryDistribution")} badge={t("adjustedTrend")} /><Chart option={countryMapOption(countries.data)} /></article>
+      <article className="panel"><PanelTitle title={t("statusTrend")} badge={t("adjustedTrend")} /><Chart option={stackedOption(edgeStatuses.data)} /></article>
+      <article className="panel"><PanelTitle title={t("cacheTrend")} badge={t("adjustedTrend")} /><Chart option={stackedOption(cacheStatuses.data)} /></article>
       <section className="rank-grid span-2">
         <Ranking title={t("topHosts")} data={hosts.data} />
         <Ranking title={t("topPaths")} data={paths.data} />
@@ -56,26 +75,42 @@ export function Overview() {
   </>;
 }
 
-function useMetric(kind: string, dimension: string, dates: { from: string; to: string }, zone: string) {
+function useMetric(kind: string, dimension: string, dates: { from: string; to: string }, zones: string[]) {
+  const zoneKey = zones.join(",");
   return useQuery({
-    queryKey: ["metrics", kind, dimension, dates.from.slice(0, 13), zone],
+    queryKey: ["metrics", kind, dimension, dates.from.slice(0, 13), zoneKey],
     queryFn: () => {
       const query = new URLSearchParams({ kind, dimension, ...dates });
-      if (zone) query.set("zones", zone);
+      if (zoneKey) query.set("zones", zoneKey);
       return endpoints.metrics(query);
     },
   });
+}
+
+function ZonePicker({ zones, selected, setSelected }: { zones: Array<{ id: string; name: string }>; selected: string[]; setSelected: (ids: string[]) => void }) {
+  const { t } = useI18n();
+  return <details className="zone-picker"><summary>{selected.length ? `${selected.length} Zone` : t("allZones")}</summary><div><button type="button" className="ghost" onClick={() => setSelected([])}>{t("allZones")}</button>{zones.map((zone) => <label key={zone.id}><input type="checkbox" checked={selected.includes(zone.id)} onChange={(event) => setSelected(event.target.checked ? [...selected, zone.id] : selected.filter((id) => id !== zone.id))} /><span>{zone.name}</span></label>)}</div></details>;
 }
 
 function metricTotal(data?: MetricResponse): number {
   return data?.series.reduce((total, series) => total + series.points.reduce((sum, point) => sum + Number(point.estimated_count), 0), 0) ?? 0;
 }
 
+function matchingMetricTotal(data: MetricResponse | undefined, predicate: (name: string) => boolean): number {
+  return data?.series.filter((series) => predicate(series.name)).reduce((total, series) => total + series.points.reduce((sum, point) => sum + Number(point.estimated_count), 0), 0) ?? 0;
+}
+
+function periodDelta(current: number, previous: number, label: string): string {
+  if (!previous) return label;
+  const value = ((current - previous) / previous) * 100;
+  return `${value >= 0 ? "+" : ""}${value.toFixed(1)}% ${label}`;
+}
+
 function PanelTitle({ title, badge }: { title: string; badge: string }) {
   return <header className="panel-title"><h2>{title}</h2><span className="badge blue">{badge}</span></header>;
 }
 
-function trendOption(http?: MetricResponse, security?: MetricResponse): Record<string, unknown> {
+function trendOption(http: MetricResponse | undefined, security: MetricResponse | undefined, requestName: string, mitigatedName: string): Record<string, unknown> {
   const request = http?.series[0]?.points ?? [];
   const mitigated = security?.series.flatMap((series) => series.points) ?? [];
   const mitigatedByTime = new Map<number, number>();
@@ -84,10 +119,26 @@ function trendOption(http?: MetricResponse, security?: MetricResponse): Record<s
     tooltip: { trigger: "axis" }, legend: { bottom: 0 }, grid: { left: 54, right: 18, top: 18, bottom: 48 },
     xAxis: { type: "time", axisLabel: { hideOverlap: true } }, yAxis: { type: "value", splitLine: { lineStyle: { opacity: 0.18 } } },
     series: [
-      { name: "Requests", type: "line", smooth: 0.25, showSymbol: false, areaStyle: { opacity: 0.1 }, data: request.map((point) => [point.bucket_start, Number(point.estimated_count)]) },
-      { name: "Mitigated", type: "line", smooth: 0.25, showSymbol: false, data: [...mitigatedByTime].map(([time, value]) => [time, value]) },
+      { name: requestName, type: "line", smooth: 0.25, showSymbol: false, areaStyle: { opacity: 0.1 }, data: request.map((point) => [point.bucket_start, Number(point.estimated_count)]) },
+      { name: mitigatedName, type: "line", smooth: 0.25, showSymbol: false, data: [...mitigatedByTime].map(([time, value]) => [time, value]) },
     ],
   };
+}
+
+function stackedOption(data?: MetricResponse): Record<string, unknown> {
+  return {
+    tooltip: { trigger: "axis" }, legend: { type: "scroll", bottom: 0 }, grid: { left: 54, right: 18, top: 18, bottom: 48 },
+    xAxis: { type: "time", axisLabel: { hideOverlap: true } }, yAxis: { type: "value", splitLine: { lineStyle: { opacity: 0.18 } } },
+    series: data?.series.filter((series) => series.name !== "未知" && series.name !== "Unknown").map((series) => ({ name: series.name, type: "line", stack: "total", areaStyle: { opacity: 0.18 }, showSymbol: false, data: series.points.map((point) => [point.bucket_start, Number(point.estimated_count)]) })) ?? [],
+  };
+}
+
+function metricQuality(data: MetricResponse | undefined, sampleLabel: string, confidenceLabel: string): string {
+  const points = data?.series.flatMap((series) => series.points) ?? [];
+  const intervals = points.map((point) => Number(point.sample_interval)).filter(Number.isFinite);
+  const average = intervals.length ? intervals.reduce((sum, value) => sum + value, 0) / intervals.length : null;
+  const confidence = points.some((point) => point.confidence_lower !== null && point.confidence_upper !== null);
+  return `${average === null ? sampleLabel : `${sampleLabel} ×${average.toFixed(2)}`}${confidence ? ` · ${confidenceLabel}` : ""}`;
 }
 
 function donutOption(data?: MetricResponse): Record<string, unknown> {

@@ -103,6 +103,11 @@ h2 { font-size: 16px; margin-bottom: 0; letter-spacing: -.015em; }
 .metric-card::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--accent); }
 .metric-card.amber::before { background: var(--amber); }.metric-card.violet::before { background: var(--violet); }.metric-card.green::before { background: var(--green); }.metric-card.red::before { background: var(--red); }
 .metric-card span { color: var(--muted); font-size: 12px; font-weight: 500; }.metric-card strong { font-size: 27px; letter-spacing: -.035em; }.metric-card small { color: var(--faint); font-size: 10px; }
+.zone-picker { position: relative; }
+.zone-picker summary { min-width: 138px; padding: 9px 34px 9px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--text); cursor: pointer; list-style: none; }
+.zone-picker summary::after { content: "⌄"; position: absolute; right: 12px; color: var(--muted); }
+.zone-picker > div { position: absolute; right: 0; z-index: 20; display: grid; gap: 7px; min-width: 220px; margin-top: 6px; padding: 10px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface); box-shadow: var(--shadow); }
+.zone-picker label { display: flex; gap: 8px; align-items: center; padding: 5px; }
 .dashboard-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }.span-2 { grid-column: span 2; }
 .rank-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; }.rank-panel { min-width: 0; margin-bottom: 0; }.rank-panel ol { display: grid; gap: 0; margin: 0; padding: 0; list-style: none; }.rank-panel li { display: grid; grid-template-columns: 20px minmax(0, 1fr) auto; align-items: center; gap: 7px; min-height: 32px; border-top: 1px solid var(--border); font-size: 10px; }.rank-panel li code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.rank-panel li strong { font-size: 10px; }.rank-index { color: var(--faint); font-family: "DM Mono", ui-monospace, monospace; }.rank-empty { display: grid; min-height: 160px; place-items: center; color: var(--faint); font-size: 11px; }
 .panel, .settings-section { border: 1px solid var(--border); border-radius: 11px; background: var(--surface); box-shadow: var(--shadow); margin-bottom: 12px; }
