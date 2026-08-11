@@ -8,7 +8,7 @@ import { useI18n } from "@/client/i18n";
 import { Notice, PageHeader } from "@/client/components/Layout";
 import { Badge, ErrorState, formatTime, Loading } from "@/client/components/Ui";
 import { RequestDetail } from "@/client/components/RequestDetail";
-import { rangeDates } from "@/client/components/TimeControls";
+import { rangeDates, TimeControls, type RangeKey } from "@/client/components/TimeControls";
 
 const column = createColumnHelper<SampledRequest>();
 
@@ -18,12 +18,16 @@ export function Requests() {
   const [draft, setDraft] = useState(() => Object.fromEntries(params));
   const [history, setHistory] = useState<string[]>([]);
   const [selected, setSelected] = useState<SampledRequest | null>(null);
+  const [range, setRangeState] = useState<RangeKey>("24h");
+  const [selectedViewId, setSelectedViewId] = useState("");
   const client = useQueryClient();
   const savedViews = useQuery({ queryKey: ["saved-views"], queryFn: () => api<{ items: Array<{ id: string; name: string; page: string; filters: Record<string, string> }> }>("/saved-views") });
   const saveView = useMutation({
     mutationFn: (name: string) => api("/saved-views", { method: "POST", body: JSON.stringify({ name, page: "requests", filters: Object.fromEntries(params) }) }),
     onSuccess: async () => client.invalidateQueries({ queryKey: ["saved-views"] }),
   });
+  const renameView = useMutation({ mutationFn: ({ id, name, filters }: { id: string; name: string; filters: Record<string, string> }) => api(`/saved-views/${id}`, { method: "PUT", body: JSON.stringify({ name, page: "requests", filters }) }), onSuccess: async () => client.invalidateQueries({ queryKey: ["saved-views"] }) });
+  const deleteView = useMutation({ mutationFn: (id: string) => api(`/saved-views/${id}`, { method: "DELETE" }), onSuccess: async () => { setSelectedViewId(""); await client.invalidateQueries({ queryKey: ["saved-views"] }); } });
   const query = useQuery({ queryKey: ["requests", params.toString()], queryFn: () => endpoints.requests(params), placeholderData: (previous) => previous });
   const columns = useMemo(() => [
     column.accessor("occurredAt", { header: t("occurredAt"), cell: (info) => formatTime(info.getValue()) }),
@@ -59,18 +63,25 @@ export function Requests() {
     setParams(next);
   }
   return <>
-    <PageHeader title={t("requests")} eyebrow={t("sampledDetail")} actions={<div className="saved-view-actions"><select aria-label={t("savedViews")} defaultValue="" onChange={(event) => { const view = savedViews.data?.items.find((item) => item.id === event.target.value); if (view) { const next = new URLSearchParams(view.filters); setDraft(view.filters); setHistory([]); setParams(next); } }}><option value="">{t("savedViews")}</option>{savedViews.data?.items.filter((item) => item.page === "requests").map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select><button onClick={() => { const name = window.prompt(t("viewName")); if (name?.trim()) saveView.mutate(name.trim()); }}>{t("saveCurrentView")}</button></div>} />
+    <PageHeader title={t("requests")} eyebrow={t("sampledDetail")} actions={<><div className="saved-view-actions"><select aria-label={t("savedViews")} value={selectedViewId} onChange={(event) => { setSelectedViewId(event.target.value); const view = savedViews.data?.items.find((item) => item.id === event.target.value); if (view) { const next = new URLSearchParams(view.filters); setDraft(view.filters); setHistory([]); setParams(next); } }}><option value="">{t("savedViews")}</option>{savedViews.data?.items.filter((item) => item.page === "requests").map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select><button onClick={() => { const name = window.prompt(t("viewName")); if (name?.trim()) saveView.mutate(name.trim()); }}>{t("saveCurrentView")}</button>{selectedViewId && <><button onClick={() => { const view = savedViews.data?.items.find((item) => item.id === selectedViewId); const name = window.prompt(t("viewName"), view?.name); if (view && name?.trim()) renameView.mutate({ id: view.id, name: name.trim(), filters: view.filters }); }}>{t("rename")}</button><button onClick={() => deleteView.mutate(selectedViewId)}>{t("delete")}</button></>}</div><TimeControls range={range} setRange={(nextRange) => { const dates = rangeDates(nextRange); const next = new URLSearchParams(params); next.set("from", dates.from); next.set("to", dates.to); next.delete("cursor"); setRangeState(nextRange); setHistory([]); setParams(next); }} /></>} />
     <Notice><strong>{t("sampling")}</strong><span>{t("samplingHelp")}</span></Notice>
     <form className="filter-panel" onSubmit={applyFilters}>
       <header><h2>{t("filters")}</h2><button type="button" className="ghost" onClick={() => { const dates = rangeDates("24h"); setDraft({}); setParams(new URLSearchParams({ ...dates, limit: "100" })); }}>{t("reset")}</button></header>
       <div className="filter-grid">
         <Filter label={t("ip")} name="ip" value={draft.ip} set={setDraft} />
+        <Filter label={t("country")} name="country" value={draft.country} set={setDraft} />
+        <Filter label={t("asn")} name="asn" value={draft.asn} set={setDraft} />
         <Filter label={t("host")} name="host" value={draft.host} set={setDraft} />
         <Filter label={t("path")} name="path" value={draft.path} set={setDraft} />
         <Filter label={t("method")} name="method" value={draft.method} set={setDraft} />
+        <Filter label={t("protocol")} name="protocol" value={draft.protocol} set={setDraft} />
         <Filter label={t("status")} name="status" value={draft.status} set={setDraft} />
         <Filter label={t("rayId")} name="rayId" value={draft.rayId} set={setDraft} />
         <Filter label={t("action")} name="securityAction" value={draft.securityAction} set={setDraft} />
+        <Filter label={t("securitySource")} name="securitySource" value={draft.securitySource} set={setDraft} />
+        <Filter label={t("cacheStatus")} name="cacheStatus" value={draft.cacheStatus} set={setDraft} />
+        <Filter label={t("requestSource")} name="requestSource" value={draft.requestSource} set={setDraft} />
+        <Filter label={t("query")} name="query" value={draft.query} set={setDraft} />
         <Filter label={t("userAgent")} name="userAgent" value={draft.userAgent} set={setDraft} />
       </div>
       <footer><button className="primary" type="submit">{t("search")}</button></footer>

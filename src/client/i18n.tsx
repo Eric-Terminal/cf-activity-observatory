@@ -131,6 +131,9 @@ const zh = {
   topIps: "活跃 IP",
   topAsns: "活跃 ASN",
   topUserAgents: "User-Agent 排名",
+  dlqJobs: "死信任务",
+  rename: "重命名",
+  delete: "删除",
 } as const;
 
 const en: Record<keyof typeof zh, string> = {
@@ -159,6 +162,8 @@ const en: Record<keyof typeof zh, string> = {
   securitySource: "Security product", ruleId: "Rule ID", query: "Query string", asn: "ASN", unknown: "Unknown", close: "Close",
   savedViews: "Investigation views", saveCurrentView: "Save current view", viewName: "View name",
   topHosts: "Top hosts", topPaths: "Top paths", topIps: "Active IPs", topAsns: "Top ASNs", topUserAgents: "Top User-Agents",
+  dlqJobs: "Dead-letter jobs",
+  rename: "Rename", delete: "Delete",
 };
 
 type Locale = "zh-CN" | "en";
