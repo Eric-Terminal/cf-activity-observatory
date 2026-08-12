@@ -40,7 +40,8 @@ All persisted/API timestamps are UTC. The UI renders them in the browser's timez
 
 ## Required Cloudflare API Token permissions
 
-- Account — Analytics — Read
+- Account — Account Analytics — Read
+- Zone — Analytics — Read
 - Zone — Zone — Read
 - Resources — only the accounts or zones you intend to observe
 

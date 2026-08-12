@@ -54,7 +54,8 @@ flowchart LR
 
 创建一个范围尽可能小的 Cloudflare API Token：
 
-- Account — Analytics — Read
+- Account — Account Analytics — Read
+- Zone — Analytics — Read
 - Zone — Zone — Read
 - Resources — 仅选择需要观测的账号或 Zone
 
