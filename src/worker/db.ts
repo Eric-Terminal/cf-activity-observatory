@@ -448,6 +448,12 @@ interface GapRow {
   reason: string;
 }
 
+export interface HealthFilter {
+  from?: number;
+  to?: number;
+  zoneIds: string[];
+}
+
 interface UsageRow {
   graphql_queries: number;
   d1_rows_read: number;
@@ -457,21 +463,44 @@ interface UsageRow {
   r2_bytes_written: number;
 }
 
-export async function getHealth(database: D1Database, warningBytes: number): Promise<CollectorHealth> {
-  const [cursorResult, gapResult, usage, dlq] = await Promise.all([
+export async function getHealth(
+  database: D1Database,
+  warningBytes: number,
+  filter: HealthFilter = { zoneIds: [] },
+): Promise<CollectorHealth> {
+  const zonePlaceholders = filter.zoneIds.map(() => "?").join(",");
+  const cursorZoneFilter = zonePlaceholders ? ` AND c.zone_id IN (${zonePlaceholders})` : "";
+  const gapZoneFilter = zonePlaceholders ? ` AND zone_id IN (${zonePlaceholders})` : "";
+  const hasRange = filter.from !== undefined && filter.to !== undefined;
+  const rangeFilter = hasRange ? " AND range_start < ? AND range_end > ?" : "";
+  const rangeBindings = hasRange ? [filter.to, filter.from] : [];
+  const [cursorResult, activeGapResult, historicalGapResult, usage, dlq] = await Promise.all([
     database
       .prepare(
         `SELECT c.zone_id, z.name AS zone_name, c.dataset, c.cursor_at, c.last_success_at,
                 c.consecutive_failures, c.last_error
          FROM sync_cursors c JOIN zones z ON z.id = c.zone_id
-         WHERE z.enabled = 1 ORDER BY z.name, c.dataset`,
+         WHERE z.enabled = 1${cursorZoneFilter} ORDER BY z.name, c.dataset`,
       )
+      .bind(...filter.zoneIds)
       .all<HealthCursorRow>(),
     database
       .prepare(
         `SELECT id, zone_id, dataset, range_start, range_end, reason
-         FROM data_gaps WHERE resolved_at IS NULL ORDER BY detected_at DESC LIMIT 100`,
+         FROM data_gaps
+         WHERE resolved_at IS NULL AND acknowledged_at IS NULL${rangeFilter}${gapZoneFilter}
+         ORDER BY zone_id, dataset, reason, range_start ASC LIMIT 500`,
       )
+      .bind(...rangeBindings, ...filter.zoneIds)
+      .all<GapRow>(),
+    database
+      .prepare(
+        `SELECT id, zone_id, dataset, range_start, range_end, reason
+         FROM data_gaps
+         WHERE resolved_at IS NULL AND acknowledged_at IS NOT NULL${gapZoneFilter}
+         ORDER BY zone_id, dataset, reason, range_start ASC LIMIT 500`,
+      )
+      .bind(...filter.zoneIds)
       .all<GapRow>(),
     database
       .prepare(
@@ -499,7 +528,7 @@ export async function getHealth(database: D1Database, warningBytes: number): Pro
       },
     ];
   });
-  const gaps = gapResult.results.flatMap((row) => {
+  const mapGaps = (rows: GapRow[]): CollectorHealth["gaps"] => rows.flatMap((row) => {
     const parsed = datasetSchema.safeParse(row.dataset);
     return parsed.success
       ? [
@@ -510,10 +539,13 @@ export async function getHealth(database: D1Database, warningBytes: number): Pro
             rangeStart: row.range_start,
             rangeEnd: row.range_end,
             reason: row.reason,
+            segmentCount: 1,
           },
         ]
       : [];
   });
+  const gaps = mergeAdjacentGaps(mapGaps(activeGapResult.results));
+  const historicalGaps = mergeAdjacentGaps(mapGaps(historicalGapResult.results));
   const usageToday = {
     graphqlQueries: usage?.graphql_queries ?? 0,
     d1RowsRead: usage?.d1_rows_read ?? 0,
@@ -523,16 +555,47 @@ export async function getHealth(database: D1Database, warningBytes: number): Pro
     r2BytesWritten: usage?.r2_bytes_written ?? 0,
   };
   const configured = cursors.length > 0;
-  const degraded = gaps.length > 0 || (dlq?.count ?? 0) > 0 || cursors.some((cursor) => cursor.consecutiveFailures >= 3);
+  const failingCursors = cursors.filter((cursor) => cursor.consecutiveFailures >= 3).length;
+  const dataStatus = !configured ? "unconfigured" : gaps.length > 0 ? "gaps" : "complete";
+  const collectorStatus = !configured
+    ? "unconfigured"
+    : (dlq?.count ?? 0) > 0 || failingCursors > 0
+      ? "degraded"
+      : "healthy";
+  const degraded = dataStatus === "gaps" || collectorStatus === "degraded";
   return {
     status: !configured ? "unconfigured" : degraded ? "degraded" : "healthy",
+    dataStatus,
+    collectorStatus,
     now: nowMs(),
     d1WarningBytes: warningBytes,
     usageToday,
     cursors,
     gaps,
+    historicalGaps,
     dlqJobs: dlq?.count ?? 0,
+    failingCursors,
   };
+}
+
+function mergeAdjacentGaps(gaps: CollectorHealth["gaps"]): CollectorHealth["gaps"] {
+  const merged: CollectorHealth["gaps"] = [];
+  for (const gap of gaps) {
+    const previous = merged.at(-1);
+    if (
+      previous
+      && previous.zoneId === gap.zoneId
+      && previous.dataset === gap.dataset
+      && previous.reason === gap.reason
+      && gap.rangeStart <= previous.rangeEnd
+    ) {
+      previous.rangeEnd = Math.max(previous.rangeEnd, gap.rangeEnd);
+      previous.segmentCount += gap.segmentCount;
+    } else {
+      merged.push({ ...gap });
+    }
+  }
+  return merged;
 }
 
 export function filtersFromUrl(url: URL): ListFilterInput {

@@ -226,8 +226,8 @@ async function acquireWindow(
     await env.DB.batch([
       env.DB.prepare(
         `INSERT OR IGNORE INTO data_gaps
-         (id, zone_id, dataset, range_start, range_end, reason, detected_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+         (id, zone_id, dataset, range_start, range_end, reason, detected_at, acknowledged_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       ).bind(
         stableId(zoneId, dataset, cursorAt, oldest, "retention"),
         zoneId,
@@ -235,6 +235,7 @@ async function acquireWindow(
         cursorAt,
         oldest,
         "停机区间已超出 Cloudflare 当前数据集可回看窗口",
+        timestamp,
         timestamp,
       ),
       env.DB.prepare(
@@ -318,6 +319,16 @@ async function collectWindow(
       .run();
   }
   stats.inserted += await persistRows(env.DB, capability.dataset, capability.zoneId, result, batchId);
+  if (!result.saturated) {
+    // 完整查询覆盖缺口后才关闭它；更大的小时修复窗口也能修复先前切分出的叶子区间。
+    await env.DB.prepare(
+      `UPDATE data_gaps SET resolved_at = ?
+       WHERE zone_id = ? AND dataset = ? AND range_start >= ? AND range_end <= ?
+         AND resolved_at IS NULL AND acknowledged_at IS NULL`,
+    )
+      .bind(nowMs(), capability.zoneId, capability.dataset, start, end)
+      .run();
+  }
 }
 
 async function persistRows(

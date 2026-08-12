@@ -79,7 +79,7 @@ export const endpoints = {
   request: (id: string) => api<SampledRequest>(`/requests/${encodeURIComponent(id)}`),
   events: (query: URLSearchParams) => api<PaginatedResult<SecurityEvent>>(`/security-events?${query}`),
   event: (id: string) => api<SecurityEvent>(`/security-events/${encodeURIComponent(id)}`),
-  health: () => api<CollectorHealth>("/health"),
+  health: (query?: URLSearchParams) => api<CollectorHealth>(`/health${query?.size ? `?${query}` : ""}`),
   archives: () => api<{ items: ArchiveItem[] }>("/archives"),
   settings: () => api<AppSettings>("/settings"),
 };

@@ -35,6 +35,75 @@ describe("Worker API 与存储", () => {
     expect(["unconfigured", "healthy"]).toContain(body.status);
   });
 
+  it("健康状态按所选范围判断缺口并与采集异常分离", async () => {
+    const timestamp = Date.now();
+    await insertZone("zone-health-range", "health-range.example");
+    await env.DB.prepare(
+      `INSERT INTO sync_cursors
+       (zone_id, dataset, cursor_at, last_success_at, consecutive_failures, updated_at)
+       VALUES ('zone-health-range', 'httpRequestsAdaptive', ?, ?, 0, ?)`,
+    ).bind(timestamp, timestamp, timestamp).run();
+    await env.DB.batch([
+      ...[0, 1, 2].map((index) => env.DB.prepare(
+        `INSERT INTO data_gaps
+         (id, zone_id, dataset, range_start, range_end, reason, detected_at, acknowledged_at)
+         VALUES (?, 'zone-health-range', 'httpRequestsAdaptive', ?, ?, '历史保留边界', ?, ?)`,
+      ).bind(`historical-gap-${index}`, timestamp - (60 - index * 5) * 60_000, timestamp - (55 - index * 5) * 60_000, timestamp, timestamp)),
+      ...[0, 1].map((index) => env.DB.prepare(
+        `INSERT INTO data_gaps
+         (id, zone_id, dataset, range_start, range_end, reason, detected_at)
+         VALUES (?, 'zone-health-range', 'httpRequestsAdaptive', ?, ?, '采样窗口饱和', ?)`,
+      ).bind(`active-gap-${index}`, timestamp - (8 - index * 2) * 60_000, timestamp - (6 - index * 2) * 60_000, timestamp)),
+      env.DB.prepare(
+        `INSERT INTO alert_state (alert_key, status, first_seen_at, last_seen_at, details)
+         VALUES ('dlq:health-range-job', 'active', ?, ?, '{}')`,
+      ).bind(timestamp, timestamp),
+    ]);
+
+    const selected = new URL("http://localhost/api/v1/health");
+    selected.searchParams.set("from", new Date(timestamp - 10 * 60_000).toISOString());
+    selected.searchParams.set("to", new Date(timestamp).toISOString());
+    selected.searchParams.set("zones", "zone-health-range");
+    const selectedResponse = await exports.default.fetch(selected.toString());
+    const selectedHealth = await selectedResponse.json<{
+      status: string;
+      dataStatus: string;
+      collectorStatus: string;
+      gaps: Array<{ rangeStart: number; rangeEnd: number; segmentCount: number }>;
+      historicalGaps: Array<{ segmentCount: number }>;
+      dlqJobs: number;
+    }>();
+    expect(selectedHealth).toMatchObject({
+      status: "degraded",
+      dataStatus: "gaps",
+      collectorStatus: "degraded",
+      dlqJobs: 1,
+    });
+    expect(selectedHealth.gaps).toEqual([expect.objectContaining({
+      rangeStart: timestamp - 8 * 60_000,
+      rangeEnd: timestamp - 4 * 60_000,
+      segmentCount: 2,
+    })]);
+    expect(selectedHealth.historicalGaps).toEqual([expect.objectContaining({ segmentCount: 3 })]);
+
+    const disjoint = new URL("http://localhost/api/v1/health");
+    disjoint.searchParams.set("from", new Date(timestamp + 60_000).toISOString());
+    disjoint.searchParams.set("to", new Date(timestamp + 2 * 60_000).toISOString());
+    disjoint.searchParams.set("zones", "zone-health-range");
+    const disjointHealth = await (await exports.default.fetch(disjoint.toString())).json<{
+      status: string;
+      dataStatus: string;
+      collectorStatus: string;
+      gaps: unknown[];
+    }>();
+    expect(disjointHealth).toMatchObject({
+      status: "degraded",
+      dataStatus: "complete",
+      collectorStatus: "degraded",
+      gaps: [],
+    });
+  });
+
   it("请求列表使用键集分页并返回采样明细", async () => {
     const timestamp = Date.now();
     await insertZone("zone-list", "list.example");
@@ -90,6 +159,11 @@ describe("Worker API 与存储", () => {
         '["dimensions_datetimeFiveMinutes","dimensions_clientRequestHTTPHost","dimensions_clientRequestPath","count","avg_sampleInterval"]',
         1000, 10, 604800, 86400, ?)`,
     ).bind(Date.now()).run();
+    await env.DB.prepare(
+      `INSERT INTO data_gaps
+       (id, zone_id, dataset, range_start, range_end, reason, detected_at)
+       VALUES ('repairable-gap', 'zone-metrics', 'httpRequestsAdaptiveGroups', ?, ?, '采样窗口饱和', ?)`,
+    ).bind(timestamp, timestamp + 300_000, Date.now()).run();
     vi.stubGlobal("fetch", vi.fn().mockImplementation((_input, init?: RequestInit) => {
       if (typeof init?.body !== "string") throw new Error("GraphQL 测试请求缺少 JSON body");
       const query = JSON.parse(init.body) as { query: string };
@@ -117,6 +191,10 @@ describe("Worker API 与存储", () => {
       { dimension_type: null, dimension_value: null },
       { dimension_type: "path", dimension_value: "/ranked" },
     ]);
+    const repairedGap = await env.DB.prepare(
+      "SELECT resolved_at FROM data_gaps WHERE id = 'repairable-gap'",
+    ).first<{ resolved_at: number | null }>();
+    expect(repairedGap?.resolved_at).not.toBeNull();
     await runMaintenance(env);
 
     const range = `from=${encodeURIComponent(new Date(timestamp - 3_600_000).toISOString())}&to=${encodeURIComponent(new Date(timestamp + 3_600_000).toISOString())}`;

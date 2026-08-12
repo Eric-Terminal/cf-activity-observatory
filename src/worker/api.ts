@@ -288,7 +288,21 @@ api.post("/settings/smtp/test", async (context) => {
   return context.json({ sent: true });
 });
 
-api.get("/health", async (context) => context.json(await getHealth(context.env.DB, Number(context.env.D1_WARNING_BYTES))));
+api.get("/health", async (context) => {
+  try {
+    const url = new URL(context.req.url);
+    const hasRange = url.searchParams.has("from") || url.searchParams.has("to");
+    const range = hasRange
+      ? parseTimeRange(url.searchParams.get("from") ?? undefined, url.searchParams.get("to") ?? undefined)
+      : {};
+    return context.json(await getHealth(context.env.DB, Number(context.env.D1_WARNING_BYTES), {
+      ...range,
+      zoneIds: parseCsv(url.searchParams.get("zones") ?? undefined),
+    }));
+  } catch (error) {
+    return jsonError(context, 422, "INVALID_HEALTH_FILTER", sanitizeError(error));
+  }
+});
 
 api.get("/export", async (context) => {
   const url = new URL(context.req.url);

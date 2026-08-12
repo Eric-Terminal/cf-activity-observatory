@@ -197,6 +197,8 @@ export interface PaginatedResult<T> {
 
 export interface CollectorHealth {
   status: "healthy" | "degraded" | "unconfigured";
+  dataStatus: "complete" | "gaps" | "unconfigured";
+  collectorStatus: "healthy" | "degraded" | "unconfigured";
   now: number;
   d1WarningBytes: number;
   usageToday: {
@@ -223,6 +225,17 @@ export interface CollectorHealth {
     rangeStart: number;
     rangeEnd: number;
     reason: string;
+    segmentCount: number;
+  }>;
+  historicalGaps: Array<{
+    id: string;
+    zoneId: string;
+    dataset: DatasetName;
+    rangeStart: number;
+    rangeEnd: number;
+    reason: string;
+    segmentCount: number;
   }>;
   dlqJobs: number;
+  failingCursors: number;
 }

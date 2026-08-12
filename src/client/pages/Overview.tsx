@@ -29,7 +29,16 @@ export function Overview() {
   const ips = useMetric("http", "ip", dates, selectedZones);
   const asns = useMetric("http", "asn", dates, selectedZones);
   const userAgents = useMetric("http", "userAgent", dates, selectedZones);
-  const health = useQuery({ queryKey: ["health"], queryFn: endpoints.health, refetchInterval: 60_000 });
+  const health = useQuery({
+    queryKey: ["health", range, zoneKey(selectedZones)],
+    queryFn: () => {
+      const query = new URLSearchParams({ ...dates });
+      const selected = zoneKey(selectedZones);
+      if (selected) query.set("zones", selected);
+      return endpoints.health(query);
+    },
+    refetchInterval: 60_000,
+  });
 
   const requestTotal = metricTotal(http.data);
   const mitigatedTotal = metricTotal(security.data);
@@ -40,6 +49,7 @@ export function Overview() {
   const originErrors = matchingMetricTotal(originStatuses.data, (name) => /^5\d\d$/.test(name));
   const cacheResponses = metricTotal(cacheStatuses.data);
   const cacheHits = matchingMetricTotal(cacheStatuses.data, (name) => /^(hit|stale|revalidated)$/i.test(name));
+  const collectorIssues = (health.data?.dlqJobs ?? 0) + (health.data?.failingCursors ?? 0);
   const cards = [
     [t("estimatedRequests"), formatNumber(requestTotal), "blue", periodDelta(requestTotal, previousRequestTotal, t("vsPrevious"))],
     [t("mitigatedRequests"), formatNumber(mitigatedTotal), "amber", periodDelta(mitigatedTotal, previousMitigatedTotal, t("vsPrevious"))],
@@ -47,7 +57,8 @@ export function Overview() {
     [t("edgeErrorRate"), requestTotal ? `${((edgeErrors / requestTotal) * 100).toFixed(2)}%` : "—", "red", t("adjustedTrend")],
     [t("originErrorRate"), originResponses ? `${((originErrors / originResponses) * 100).toFixed(2)}%` : "—", "red", t("adjustedTrend")],
     [t("cacheHitRate"), cacheResponses ? `${((cacheHits / cacheResponses) * 100).toFixed(2)}%` : "—", "green", t("adjustedTrend")],
-    [t("dataHealth"), t(health.data?.status ?? "unconfigured"), health.data?.status === "healthy" ? "green" : "red", `${health.data?.gaps.length ?? 0} ${t("gaps")}`],
+    [t("dataHealth"), health.data?.dataStatus === "complete" ? t("complete") : health.data?.dataStatus === "gaps" ? t("gapsDetected") : t("unconfigured"), health.data?.dataStatus === "complete" ? "green" : "red", health.data?.dataStatus === "complete" ? t("selectedRangeComplete") : `${health.data?.gaps.length ?? 0} ${t("gaps")}`],
+    [t("collectionHealth"), t(health.data?.collectorStatus ?? "unconfigured"), health.data?.collectorStatus === "healthy" ? "green" : "amber", collectorIssues ? `${health.data?.dlqJobs ?? 0} ${t("dlqJobs")} · ${health.data?.failingCursors ?? 0} ${t("failingCursors")}` : t("noCollectorIssues")],
   ];
   const loading = http.isLoading || security.isLoading || previousHttp.isLoading || previousSecurity.isLoading || edgeStatuses.isLoading || originStatuses.isLoading || cacheStatuses.isLoading || countries.isLoading || hosts.isLoading || paths.isLoading || ips.isLoading || asns.isLoading || userAgents.isLoading;
   const error = http.error ?? security.error ?? previousHttp.error ?? previousSecurity.error ?? edgeStatuses.error ?? originStatuses.error ?? cacheStatuses.error ?? countries.error ?? hosts.error ?? paths.error ?? ips.error ?? asns.error ?? userAgents.error;
@@ -74,15 +85,19 @@ export function Overview() {
 }
 
 function useMetric(kind: string, dimension: string, dates: { from: string; to: string }, zones: string[]) {
-  const zoneKey = zones.join(",");
+  const selected = zoneKey(zones);
   return useQuery({
-    queryKey: ["metrics", kind, dimension, dates.from.slice(0, 13), zoneKey],
+    queryKey: ["metrics", kind, dimension, dates.from.slice(0, 13), selected],
     queryFn: () => {
       const query = new URLSearchParams({ kind, dimension, ...dates });
-      if (zoneKey) query.set("zones", zoneKey);
+      if (selected) query.set("zones", selected);
       return endpoints.metrics(query);
     },
   });
+}
+
+function zoneKey(zones: string[]): string {
+  return zones.join(",");
 }
 
 function ZonePicker({ zones, selected, setSelected }: { zones: Array<{ id: string; name: string }>; selected: string[]; setSelected: (ids: string[]) => void }) {
