@@ -56,6 +56,18 @@ test("英文与移动布局可用", async ({ page }) => {
   expect(overflow).toBe(false);
 });
 
+test("导航栏随浅色与深色主题切换", async ({ page }) => {
+  await page.goto("/");
+  const theme = page.getByRole("combobox", { name: "主题" });
+  const nav = page.locator(".global-nav");
+  await theme.selectOption("light");
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+  await expect(nav).toHaveCSS("color", "rgb(29, 29, 31)");
+  await theme.selectOption("dark");
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  await expect(nav).toHaveCSS("color", "rgb(245, 245, 247)");
+});
+
 function fixture(pathname: string): unknown {
   if (pathname.endsWith("/me")) return { email: "test@example.com", subject: "test" };
   if (pathname.endsWith("/zones")) return { zones: [], capabilities: [] };
