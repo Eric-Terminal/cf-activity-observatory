@@ -16,6 +16,14 @@ test("总览明确区分校正趋势与采样明细", async ({ page }) => {
   await expect(page.locator(".metric-card")).toHaveCount(7);
 });
 
+test("趋势图可展开并通过 Escape 返回总览", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "展开图表：请求与缓解趋势" }).click();
+  await expect(page.getByRole("dialog").getByRole("heading", { name: "请求与缓解趋势" })).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+});
+
 test("请求筛选会同步到 URL，并可在刷新后恢复", async ({ page }) => {
   await page.goto("/requests");
   await page.getByLabel("IP", { exact: true }).fill("192.0.2.10");
@@ -30,7 +38,7 @@ test("英文与移动布局可用", async ({ page }) => {
   await page.getByRole("combobox", { name: "语言" }).selectOption("en");
   await expect(page.getByRole("heading", { name: "Settings & Health" })).toBeVisible();
   await page.setViewportSize({ width: 390, height: 844 });
-  await expect(page.locator(".sidebar")).toHaveCSS("position", "fixed");
+  await expect(page.locator(".global-nav nav")).toHaveCSS("position", "fixed");
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth);
   expect(overflow).toBe(false);
 });
@@ -38,7 +46,7 @@ test("英文与移动布局可用", async ({ page }) => {
 function fixture(pathname: string): unknown {
   if (pathname.endsWith("/me")) return { email: "test@example.com", subject: "test" };
   if (pathname.endsWith("/zones")) return { zones: [], capabilities: [] };
-  if (pathname.endsWith("/metrics")) return { bucketSeconds: 300, series: [] };
+  if (pathname.endsWith("/metrics")) return { bucketSeconds: 300, series: [{ name: "fixture", points: [{ bucket_start: Date.now(), estimated_count: 12, sample_interval: 1, confidence_lower: null, confidence_upper: null }] }] };
   if (pathname.endsWith("/requests")) return { items: [], nextCursor: null };
   if (pathname.endsWith("/security-events")) return { items: [], nextCursor: null };
   if (pathname.endsWith("/archives")) return { items: [] };
