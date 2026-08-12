@@ -24,6 +24,19 @@ test("趋势图可展开并通过 Escape 返回总览", async ({ page }) => {
   await expect(page.getByRole("dialog")).toHaveCount(0);
 });
 
+test("多系列趋势可以只显示指定状态", async ({ page }) => {
+  await page.goto("/");
+  const panel = page.getByRole("article").filter({ has: page.getByRole("heading", { name: "状态码趋势" }) });
+  const trigger = panel.getByRole("button", { name: "显示系列：状态码趋势" });
+  await trigger.click();
+  await panel.getByRole("button", { name: "只看 200" }).click();
+  await expect(trigger).toContainText("1/2");
+  await expect(panel.getByRole("checkbox", { name: "200" })).toBeChecked();
+  await expect(panel.getByRole("checkbox", { name: "403" })).not.toBeChecked();
+  await panel.getByRole("button", { name: "显示全部" }).click();
+  await expect(trigger).toContainText("2/2");
+});
+
 test("请求筛选会同步到 URL，并可在刷新后恢复", async ({ page }) => {
   await page.goto("/requests");
   await page.getByLabel("IP", { exact: true }).fill("192.0.2.10");
@@ -46,7 +59,7 @@ test("英文与移动布局可用", async ({ page }) => {
 function fixture(pathname: string): unknown {
   if (pathname.endsWith("/me")) return { email: "test@example.com", subject: "test" };
   if (pathname.endsWith("/zones")) return { zones: [], capabilities: [] };
-  if (pathname.endsWith("/metrics")) return { bucketSeconds: 300, series: [{ name: "fixture", points: [{ bucket_start: Date.now(), estimated_count: 12, sample_interval: 1, confidence_lower: null, confidence_upper: null }] }] };
+  if (pathname.endsWith("/metrics")) return { bucketSeconds: 300, series: ["200", "403"].map((name, index) => ({ name, points: [{ bucket_start: Date.now(), estimated_count: 12 - index, sample_interval: 1, confidence_lower: null, confidence_upper: null }] })) };
   if (pathname.endsWith("/requests")) return { items: [], nextCursor: null };
   if (pathname.endsWith("/security-events")) return { items: [], nextCursor: null };
   if (pathname.endsWith("/archives")) return { items: [] };
