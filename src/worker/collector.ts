@@ -24,6 +24,7 @@ import {
 
 const DATA_DELAY_MS = 5 * MINUTE_MS;
 const RETENTION_BOUNDARY_MARGIN_MS = 15 * MINUTE_MS;
+const MAX_COLLECTION_WINDOW_MS = HOUR_MS;
 const CAPABILITY_MAX_AGE_MS = DAY_MS;
 const MIN_SPLIT_WINDOW_MS = 1_000;
 const GRAPHQL_BUDGET_PER_FIVE_MINUTES = 240;
@@ -226,7 +227,7 @@ async function acquireWindow(
     cursorAt = oldest;
   }
   if (cursorAt >= stableEnd) return null;
-  const maxDuration = Math.max(MINUTE_MS, (capability.maxDuration ?? 300) * 1000);
+  const maxDuration = collectionWindowDuration(capability.maxDuration);
   const end = Math.min(cursorAt + maxDuration, stableEnd);
   const acquired = await env.DB.prepare(
     `UPDATE sync_cursors SET in_flight_until = ?, updated_at = ?
@@ -248,6 +249,14 @@ export function oldestQueryableAt(scheduledAt: number, notOlderThanSeconds: numb
   return floorTo(
     Math.min(scheduledAt - DATA_DELAY_MS, scheduledAt - historyWindow + safetyMargin),
     MINUTE_MS,
+  );
+}
+
+export function collectionWindowDuration(maxDurationSeconds: number | null): number {
+  // 数据集声明的是服务端允许上限；高基数查询还需限制单次 Worker 调用的 GraphQL 子请求数量。
+  return Math.max(
+    MINUTE_MS,
+    Math.min((maxDurationSeconds ?? 300) * 1000, MAX_COLLECTION_WINDOW_MS),
   );
 }
 

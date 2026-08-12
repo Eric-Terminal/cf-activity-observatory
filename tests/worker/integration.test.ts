@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { env, exports } from "cloudflare:workers";
-import { oldestQueryableAt, processCollectJob, retryDelay } from "@/worker/collector";
+import {
+  collectionWindowDuration,
+  oldestQueryableAt,
+  processCollectJob,
+  retryDelay,
+} from "@/worker/collector";
 import { runMaintenance } from "@/worker/archive";
 import { csvCell, estimateDailyQueueOperations } from "@/worker/api";
 import { dotStuff, mimeMessage } from "@/worker/smtp";
@@ -137,6 +142,11 @@ describe("安全边界与协议细节", () => {
   it("极短可回看窗口不会越过稳定数据终点", () => {
     const scheduledAt = Date.UTC(2026, 7, 12, 8, 0);
     expect(oldestQueryableAt(scheduledAt, 60)).toBe(scheduledAt - 5 * 60_000);
+  });
+
+  it("将服务端允许的超长窗口收紧到单次 Worker 可安全处理的一小时", () => {
+    expect(collectionWindowDuration(86_400)).toBe(3_600_000);
+    expect(collectionWindowDuration(300)).toBe(300_000);
   });
 
   it("Queue 预算估算包含四数据集实时任务和每小时修复", () => {
