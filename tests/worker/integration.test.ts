@@ -48,23 +48,32 @@ describe("Worker API 与存储", () => {
     expect(body.items[0]?.rayId).toBe("ray-one");
   });
 
-  it("重复采集同一明细不会产生重复记录", async () => {
+  it("重复采集同一明细时补齐 ASN 且不产生重复记录", async () => {
     const timestamp = Date.now() - 10 * 60_000;
     await insertZone("zone-collect", "collect.example");
     await env.DB.prepare(
       `INSERT INTO dataset_capabilities
        (zone_id, dataset, enabled, available_fields, max_page_size, max_number_of_fields, not_older_than, max_duration, checked_at)
-       VALUES ('zone-collect', 'httpRequestsAdaptive', 1, '["datetime","rayName","clientIP"]', 1000, 10, 604800, 86400, ?)`,
+       VALUES ('zone-collect', 'httpRequestsAdaptive', 1, '["datetime","rayName","clientIP","clientAsn","clientASNDescription"]', 1000, 10, 604800, 86400, ?)`,
     ).bind(Date.now()).run();
-    const payload = {
-      data: { viewer: { zones: [{ httpRequestsAdaptive: [{ datetime: new Date(timestamp).toISOString(), rayName: "same-ray", clientIP: "198.51.100.2" }] }] } },
+    const initialPayload = {
+      data: { viewer: { zones: [{ httpRequestsAdaptive: [{ datetime: new Date(timestamp).toISOString(), rayName: "same-ray", clientIP: "198.51.100.2", clientASNDescription: "Example Network" }] }] } },
     };
-    vi.stubGlobal("fetch", vi.fn().mockImplementation(() => Promise.resolve(new Response(JSON.stringify(payload), { status: 200, headers: { "Content-Type": "application/json" } }))));
+    const repairedPayload = {
+      data: { viewer: { zones: [{ httpRequestsAdaptive: [{ datetime: new Date(timestamp).toISOString(), rayName: "same-ray", clientIP: "198.51.100.2", clientAsn: 64500, clientASNDescription: "Example Network" }] }] } },
+    };
+    vi.stubGlobal("fetch", vi.fn()
+      .mockImplementationOnce(() => Promise.resolve(new Response(JSON.stringify(initialPayload), { status: 200, headers: { "Content-Type": "application/json" } })))
+      .mockImplementationOnce((_input, init?: RequestInit) => {
+        if (typeof init?.body !== "string") throw new Error("GraphQL 测试请求缺少 JSON body");
+        expect(init.body).toContain("clientAsn");
+        return Promise.resolve(new Response(JSON.stringify(repairedPayload), { status: 200, headers: { "Content-Type": "application/json" } }));
+      }));
     const base = { version: 1 as const, type: "collect" as const, zoneId: "zone-collect", dataset: "httpRequestsAdaptive" as const, start: timestamp - 1000, end: timestamp + 1000, mode: "repair" as const };
     await processCollectJob(env, { ...base, id: "collect-one" });
     await processCollectJob(env, { ...base, id: "collect-two" });
-    const count = await env.DB.prepare("SELECT COUNT(*) AS count FROM request_samples WHERE zone_id = 'zone-collect'").first<{ count: number }>();
-    expect(count?.count).toBe(1);
+    const stored = await env.DB.prepare("SELECT COUNT(*) AS count, MAX(asn) AS asn FROM request_samples WHERE zone_id = 'zone-collect'").first<{ count: number; asn: number | null }>();
+    expect(stored).toEqual({ count: 1, asn: 64500 });
   });
 
   it("聚合总量不会重复计入高基数排名 cube", async () => {

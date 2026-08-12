@@ -327,9 +327,11 @@ async function persistRows(
 function requestStatement(database: D1Database, zoneId: string, row: Record<string, unknown>, batchId: string): D1PreparedStatement {
   const occurredAt = parseCloudflareTime(row.datetime) ?? nowMs();
   const rayId = asString(row.rayName);
-  const id = stableId(zoneId, occurredAt, rayId, canonicalJson(row));
+  // ASN 字段曾因大小写错误而未被查询；排除它可保持旧记录 ID 稳定，让修复后的回采原位补齐号码。
+  const identityRow = Object.fromEntries(Object.entries(row).filter(([key]) => key !== "clientAsn"));
+  const id = stableId(zoneId, occurredAt, rayId, canonicalJson(identityRow));
   const known = new Set([
-    "datetime", "rayName", "clientIP", "clientCountryName", "clientASN", "clientASNDescription", "userAgent",
+    "datetime", "rayName", "clientIP", "clientCountryName", "clientAsn", "clientASNDescription", "userAgent",
     "clientRefererHost", "clientDeviceType", "clientRequestHTTPHost", "clientRequestPath", "clientRequestQuery",
     "clientRequestHTTPMethodName", "clientRequestHTTPProtocol", "requestSource", "coloCode", "cacheStatus",
     "originResponseStatus", "edgeResponseStatus", "securityAction", "securitySource", "securityRuleID",
@@ -338,15 +340,17 @@ function requestStatement(database: D1Database, zoneId: string, row: Record<stri
     "leakedCredentialCheckResult", "sampleInterval",
   ]);
   return database.prepare(
-    `INSERT OR IGNORE INTO request_samples
+    `INSERT INTO request_samples
      (id, zone_id, occurred_at, ray_id, client_ip, country, asn, asn_description, user_agent, referer,
       device_type, host, path, query, method, protocol, request_source, colo, cache_status, origin_status,
       edge_status, security_action, security_source, security_rule_id, bot_score, bot_score_source, bot_tags,
       verified_bot_category, attack_score, content_scan_result, leaked_credential_result, sample_interval,
       collected_at, batch_id, extra)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET asn = excluded.asn
+     WHERE request_samples.asn IS NULL AND excluded.asn IS NOT NULL`,
   ).bind(
-    id, zoneId, occurredAt, rayId, asString(row.clientIP), asString(row.clientCountryName), asNumber(row.clientASN),
+    id, zoneId, occurredAt, rayId, asString(row.clientIP), asString(row.clientCountryName), asNumber(row.clientAsn),
     asString(row.clientASNDescription), asString(row.userAgent), asString(row.clientRefererHost), asString(row.clientDeviceType),
     asString(row.clientRequestHTTPHost), asString(row.clientRequestPath), asString(row.clientRequestQuery),
     asString(row.clientRequestHTTPMethodName), asString(row.clientRequestHTTPProtocol), asString(row.requestSource),
@@ -365,18 +369,20 @@ function eventStatement(database: D1Database, zoneId: string, row: Record<string
   const id = stableId(zoneId, occurredAt, rayId, asString(row.source), asString(row.ruleId), asString(row.action));
   const known = new Set([
     "datetime", "rayName", "action", "source", "ruleId", "description", "rulesetId", "kind", "clientIP",
-    "clientCountryName", "clientASN", "clientRequestHTTPHost", "clientRequestPath", "clientRequestQuery",
+    "clientCountryName", "clientAsn", "clientRequestHTTPHost", "clientRequestPath", "clientRequestQuery",
     "clientRequestHTTPMethodName", "userAgent", "sampleInterval",
   ]);
   return database.prepare(
-    `INSERT OR IGNORE INTO security_events
+    `INSERT INTO security_events
      (id, zone_id, occurred_at, ray_id, action, source, rule_id, rule_description, ruleset_id, kind,
       client_ip, country, asn, host, path, query, method, user_agent, sample_interval, collected_at, batch_id, extra)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET asn = excluded.asn
+     WHERE security_events.asn IS NULL AND excluded.asn IS NOT NULL`,
   ).bind(
     id, zoneId, occurredAt, rayId, asString(row.action), asString(row.source), asString(row.ruleId),
     asString(row.description), asString(row.rulesetId), asString(row.kind), asString(row.clientIP),
-    asString(row.clientCountryName), asNumber(row.clientASN), asString(row.clientRequestHTTPHost),
+    asString(row.clientCountryName), asNumber(row.clientAsn), asString(row.clientRequestHTTPHost),
     asString(row.clientRequestPath), asString(row.clientRequestQuery), asString(row.clientRequestHTTPMethodName),
     asString(row.userAgent), asNumber(row.sampleInterval), nowMs(), batchId, JSON.stringify(remaining(row, known)),
   );
@@ -409,7 +415,7 @@ function metricStatement(database: D1Database, dataset: DatasetName, zoneId: str
       edge_response_bytes = excluded.edge_response_bytes, visits = excluded.visits, updated_at = excluded.updated_at`,
   ).bind(
     id, zoneId, bucketStart, bucketSeconds, metricKind, signature, asString(dimensions.clientRequestHTTPHost),
-    asString(dimensions.clientCountryName), asNumber(dimensions.clientASN), asString(dimensions.clientRequestHTTPMethodName),
+    asString(dimensions.clientCountryName), asNumber(dimensions.clientAsn), asString(dimensions.clientRequestHTTPMethodName),
     asString(dimensions.clientRequestHTTPProtocol), asNumber(dimensions.edgeResponseStatus),
     asNumber(dimensions.originResponseStatus),
     statusClass(asNumber(dimensions.edgeResponseStatus)), asString(dimensions.cacheStatus),
@@ -421,7 +427,7 @@ function metricStatement(database: D1Database, dataset: DatasetName, zoneId: str
 }
 
 function rankingValue(dimensions: Record<string, unknown>, type: string | null): string | null {
-  const field = { path: "clientRequestPath", ip: "clientIP", asn: "clientASN", userAgent: "userAgent", rule: "ruleId" }[type ?? ""];
+  const field = { path: "clientRequestPath", ip: "clientIP", asn: "clientAsn", userAgent: "userAgent", rule: "ruleId" }[type ?? ""];
   const value = field ? dimensions[field] : null;
   return typeof value === "string" || typeof value === "number" ? String(value) : null;
 }

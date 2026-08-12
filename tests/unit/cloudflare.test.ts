@@ -18,6 +18,21 @@ describe("Cloudflare GraphQL 查询构建", () => {
     expect(selectedFields(capability)).toEqual(["datetime", "rayName"]);
   });
 
+  it("使用 Cloudflare 能力接口公布的 clientAsn 字段名", () => {
+    const capability: DatasetCapability = {
+      zoneId: "zone",
+      dataset: "httpRequestsAdaptive",
+      enabled: true,
+      availableFields: ["datetime", "clientAsn", "clientASNDescription"],
+      maxPageSize: 1000,
+      maxNumberOfFields: 10,
+      notOlderThan: 604800,
+      maxDuration: 86400,
+      checkedAt: 0,
+    };
+    expect(selectedFields(capability)).toEqual(["datetime", "clientAsn", "clientASNDescription"]);
+  });
+
   it("构建明细查询时使用半开时间筛选", () => {
     const query = buildDatasetQuery("firewallEventsAdaptive", ["datetime", "action"], 250);
     expect(query).toContain("datetime_geq: $start");

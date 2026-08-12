@@ -50,7 +50,7 @@ export const PREFERRED_FIELDS: Record<DatasetName, string[]> = {
     "rayName",
     "clientIP",
     "clientCountryName",
-    "clientASN",
+    "clientAsn",
     "clientASNDescription",
     "userAgent",
     "clientRefererHost",
@@ -92,7 +92,7 @@ export const PREFERRED_FIELDS: Record<DatasetName, string[]> = {
     "kind",
     "clientIP",
     "clientCountryName",
-    "clientASN",
+    "clientAsn",
     "clientRequestHTTPHost",
     "clientRequestPath",
     "clientRequestQuery",
@@ -310,7 +310,7 @@ function rankingSelections(capability: DatasetCapability): RankingSelection[] {
   const count = permitted("count") ? "count" : null;
   if (!time || !count) return [];
   const dimensions: Array<[string, RankingSelection["dimensionType"]]> = capability.dataset === "httpRequestsAdaptiveGroups"
-    ? [["dimensions_clientRequestPath", "path"], ["dimensions_clientIP", "ip"], ["dimensions_clientASN", "asn"], ["dimensions_userAgent", "userAgent"]]
+    ? [["dimensions_clientRequestPath", "path"], ["dimensions_clientIP", "ip"], ["dimensions_clientAsn", "asn"], ["dimensions_userAgent", "userAgent"]]
     : [["dimensions_ruleId", "rule"]];
   return dimensions.filter(([dimension]) => permitted(dimension)).map(([dimension, dimensionType]) => ({
     fields: [time, dimension, count, ...(permitted("avg_sampleInterval") ? ["avg_sampleInterval"] : [])],
