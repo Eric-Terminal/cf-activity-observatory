@@ -2,6 +2,7 @@ import { decryptSecret } from "@/worker/crypto";
 import { sendSmtp } from "@/worker/smtp";
 import { asRecord, nowMs, sanitizeError } from "@/worker/utils";
 import { smtpConfigSchema, type SmtpConfigInput } from "@/shared/contracts";
+import { D1_DAILY_WRITE_PAUSE } from "@/worker/budgets";
 
 const ALERT_COOLDOWN_MS = 60 * 60 * 1000;
 
@@ -28,6 +29,13 @@ interface AlertStateRow {
 
 export async function evaluateAlerts(env: Env): Promise<void> {
   const timestamp = nowMs();
+  const usage = await env.DB.prepare(
+    `SELECT d1_rows_written, d1_size_after, queue_messages, graphql_queries
+     FROM usage_daily WHERE day = ?`,
+  )
+    .bind(new Date(timestamp).toISOString().slice(0, 10))
+    .first<Record<string, unknown>>();
+  const collectionPaused = Number(usage?.d1_rows_written ?? 0) >= D1_DAILY_WRITE_PAUSE;
   const failing = await env.DB.prepare(
     `SELECT c.zone_id, z.name AS zone_name, c.dataset, c.consecutive_failures, c.last_success_at,
       c.last_error, z.poll_interval_minutes
@@ -38,6 +46,7 @@ export async function evaluateAlerts(env: Env): Promise<void> {
     .all<Record<string, unknown>>();
   const active = new Map<string, { title: string; details: string }>();
   for (const raw of failing.results) {
+    if (collectionPaused) continue;
     const row = asRecord(raw);
     const threshold = Math.max(Number(row.poll_interval_minutes) * 3, 15) * 60_000;
     const lastSuccess = Number(row.last_success_at ?? 0);
@@ -49,13 +58,7 @@ export async function evaluateAlerts(env: Env): Promise<void> {
       });
     }
   }
-  const usage = await env.DB.prepare(
-    `SELECT d1_rows_written, d1_size_after, queue_messages, graphql_queries
-     FROM usage_daily WHERE day = ?`,
-  )
-    .bind(new Date(timestamp).toISOString().slice(0, 10))
-    .first<Record<string, unknown>>();
-  if (Number(usage?.d1_rows_written ?? 0) >= 80_000) {
+  if (collectionPaused) {
     active.set("budget:d1-writes", { title: "D1 写入额度达到 80%", details: "采集已停止推进游标，UTC 零点后自动恢复。" });
   }
   if (Number(usage?.d1_size_after ?? 0) >= Number(env.D1_WARNING_BYTES)) {

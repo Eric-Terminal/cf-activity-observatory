@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { env, exports } from "cloudflare:workers";
+import { createMessageBatch } from "cloudflare:test";
 import {
   collectionWindowDuration,
+  dispatchScheduled,
   oldestQueryableAt,
   processCollectJob,
   retryDelay,
@@ -10,6 +12,8 @@ import { runMaintenance } from "@/worker/archive";
 import { csvCell, estimateDailyQueueOperations } from "@/worker/api";
 import { dotStuff, mimeMessage } from "@/worker/smtp";
 import { CloudflareApiError } from "@/worker/cloudflare";
+import { evaluateAlerts } from "@/worker/alerts";
+import worker from "@/worker/index";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -138,6 +142,157 @@ describe("Worker API 与存储", () => {
     expect(manifest?.status).toBe("verified");
     expect(await env.ARCHIVES.head(manifest?.r2_key ?? "missing")).not.toBeNull();
   });
+
+  it("D1 写入预算暂停时不再调度采集任务", async () => {
+    const scheduledAt = Date.UTC(2026, 7, 12, 10, 20);
+    await insertZone("zone-budget-dispatch", "budget-dispatch.example");
+    await setD1Writes(80_000);
+    const fetchMock = vi.fn(() => Promise.reject(new Error("预算暂停时不应请求 Cloudflare")));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await dispatchScheduled(env, scheduledAt);
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    const zone = await env.DB.prepare(
+      "SELECT last_scheduled_at FROM zones WHERE id = 'zone-budget-dispatch'",
+    ).first<{ last_scheduled_at: number | null }>();
+    expect(zone?.last_scheduled_at).toBeNull();
+    const cursors = await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM sync_cursors WHERE zone_id = 'zone-budget-dispatch'",
+    ).first<{ count: number }>();
+    expect(cursors?.count).toBe(0);
+  });
+
+  it("预算暂停会正常跳过队列任务并释放回填租约", async () => {
+    const timestamp = Date.now();
+    await insertZone("zone-budget-consumer", "budget-consumer.example");
+    await env.DB.prepare(
+      `INSERT INTO sync_cursors
+       (zone_id, dataset, cursor_at, last_success_at, consecutive_failures, in_flight_until, last_error, updated_at)
+       VALUES ('zone-budget-consumer', 'httpRequestsAdaptive', ?, ?, 2, ?, '此前的真实错误', ?)`,
+    ).bind(timestamp - 60_000, timestamp - 120_000, timestamp + 15 * 60_000, timestamp).run();
+    await setD1Writes(80_000, timestamp);
+    const fetchMock = vi.fn(() => Promise.reject(new Error("预算暂停时不应请求 Cloudflare")));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const outcome = await processCollectJob(env, {
+      version: 1,
+      type: "collect",
+      id: "budget-paused-job",
+      zoneId: "zone-budget-consumer",
+      dataset: "httpRequestsAdaptive",
+      start: timestamp - 60_000,
+      end: timestamp,
+      mode: "backfill",
+    });
+
+    expect(outcome).toBe("budget-paused");
+    expect(fetchMock).not.toHaveBeenCalled();
+    const cursor = await env.DB.prepare(
+      `SELECT consecutive_failures, in_flight_until, last_error FROM sync_cursors
+       WHERE zone_id = 'zone-budget-consumer' AND dataset = 'httpRequestsAdaptive'`,
+    ).first<{ consecutive_failures: number; in_flight_until: number | null; last_error: string | null }>();
+    expect(cursor).toEqual({ consecutive_failures: 2, in_flight_until: null, last_error: "此前的真实错误" });
+    const run = await env.DB.prepare(
+      "SELECT id FROM collector_runs WHERE id = 'budget-paused-job'",
+    ).first<{ id: string }>();
+    expect(run).toBeNull();
+  });
+
+  it("Queue 消费者会确认预算暂停任务而不是重试", async () => {
+    const timestamp = Date.now();
+    await insertZone("zone-budget-queue", "budget-queue.example");
+    await env.DB.prepare(
+      `INSERT INTO sync_cursors (zone_id, dataset, cursor_at, consecutive_failures, in_flight_until, updated_at)
+       VALUES ('zone-budget-queue', 'httpRequestsAdaptive', ?, 0, ?, ?)`,
+    ).bind(timestamp - 60_000, timestamp + 15 * 60_000, timestamp).run();
+    await setD1Writes(80_000, timestamp);
+
+    const batch = createMessageBatch("cf-activity-observatory", [{
+      id: "budget-queue-message",
+      timestamp: new Date(timestamp),
+      attempts: 1,
+      body: {
+        version: 1,
+        type: "collect",
+        id: "budget-queue-job",
+        zoneId: "zone-budget-queue",
+        dataset: "httpRequestsAdaptive",
+        start: timestamp - 60_000,
+        end: timestamp,
+        mode: "backfill",
+      },
+    }]);
+    const message = batch.messages[0];
+    if (!message) throw new Error("队列测试消息创建失败");
+    const ack = vi.spyOn(message, "ack");
+    const retry = vi.spyOn(message, "retry");
+    await worker.queue(batch, env);
+
+    expect(ack).toHaveBeenCalledOnce();
+    expect(retry).not.toHaveBeenCalled();
+  });
+
+  it("Queue 消费者仍会重试真正的采集错误", async () => {
+    const timestamp = Date.now();
+    await insertZone("zone-real-failure", "real-failure.example");
+    await env.DB.prepare(
+      `INSERT INTO sync_cursors (zone_id, dataset, cursor_at, consecutive_failures, in_flight_until, updated_at)
+       VALUES ('zone-real-failure', 'httpRequestsAdaptive', ?, 0, ?, ?)`,
+    ).bind(timestamp - 60_000, timestamp + 15 * 60_000, timestamp).run();
+    await setD1Writes(0, timestamp);
+    const batch = createMessageBatch("cf-activity-observatory", [{
+      id: "real-failure-message",
+      timestamp: new Date(timestamp),
+      attempts: 1,
+      body: {
+        version: 1,
+        type: "collect",
+        id: "real-failure-job",
+        zoneId: "zone-real-failure",
+        dataset: "httpRequestsAdaptive",
+        start: timestamp - 60_000,
+        end: timestamp,
+        mode: "backfill",
+      },
+    }]);
+    const message = batch.messages[0];
+    if (!message) throw new Error("队列测试消息创建失败");
+    const ack = vi.spyOn(message, "ack");
+    const retry = vi.spyOn(message, "retry");
+
+    await worker.queue(batch, env);
+
+    expect(ack).not.toHaveBeenCalled();
+    expect(retry).toHaveBeenCalledOnce();
+  });
+
+  it("预算暂停期间不会把陈旧游标重复报告为采集故障", async () => {
+    const timestamp = Date.now();
+    await insertZone("zone-budget-alert", "budget-alert.example");
+    await env.DB.prepare(
+      `INSERT INTO sync_cursors
+       (zone_id, dataset, cursor_at, last_success_at, consecutive_failures, last_error, updated_at)
+       VALUES ('zone-budget-alert', 'httpRequestsAdaptive', ?, ?, 9, '旧采集错误', ?)`,
+    ).bind(timestamp - 3_600_000, timestamp - 3_600_000, timestamp).run();
+    await env.DB.prepare(
+      `INSERT INTO alert_state (alert_key, status, first_seen_at, last_seen_at, details)
+       VALUES ('collector:zone-budget-alert:httpRequestsAdaptive', 'active', ?, ?, '{}')`,
+    ).bind(timestamp - 60_000, timestamp - 60_000).run();
+    await setD1Writes(80_000, timestamp);
+
+    await evaluateAlerts(env);
+
+    const alerts = await env.DB.prepare(
+      `SELECT alert_key, status FROM alert_state
+       WHERE alert_key IN ('collector:zone-budget-alert:httpRequestsAdaptive', 'budget:d1-writes')
+       ORDER BY alert_key`,
+    ).all<{ alert_key: string; status: string }>();
+    expect(alerts.results).toEqual([
+      { alert_key: "budget:d1-writes", status: "active" },
+      { alert_key: "collector:zone-budget-alert:httpRequestsAdaptive", status: "recovered" },
+    ]);
+  });
 });
 
 describe("安全边界与协议细节", () => {
@@ -186,4 +341,12 @@ async function insertZone(id: string, name: string): Promise<void> {
      (id, name, enabled, poll_interval_minutes, detail_retention_days, created_at, updated_at)
      VALUES (?, ?, 1, 5, 90, ?, ?)`,
   ).bind(id, name, timestamp, timestamp).run();
+}
+
+async function setD1Writes(rows: number, timestamp = Date.now()): Promise<void> {
+  const day = new Date(timestamp).toISOString().slice(0, 10);
+  await env.DB.prepare(
+    `INSERT INTO usage_daily (day, d1_rows_written, updated_at) VALUES (?, ?, ?)
+     ON CONFLICT(day) DO UPDATE SET d1_rows_written = excluded.d1_rows_written, updated_at = excluded.updated_at`,
+  ).bind(day, rows, timestamp).run();
 }

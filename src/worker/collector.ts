@@ -7,6 +7,7 @@ import {
   type DatasetResult,
 } from "@/worker/cloudflare";
 import { getCapability, incrementUsage, recordD1Usage } from "@/worker/db";
+import { d1WritesPaused } from "@/worker/budgets";
 import {
   asNumber,
   asRecord,
@@ -28,8 +29,6 @@ const MAX_COLLECTION_WINDOW_MS = HOUR_MS;
 const CAPABILITY_MAX_AGE_MS = DAY_MS;
 const MIN_SPLIT_WINDOW_MS = 1_000;
 const GRAPHQL_BUDGET_PER_FIVE_MINUTES = 240;
-const D1_DAILY_WRITE_PAUSE = 80_000;
-
 interface CollectStats {
   queries: number;
   returned: number;
@@ -38,15 +37,18 @@ interface CollectStats {
 }
 
 export async function dispatchScheduled(env: Env, scheduledAt = nowMs()): Promise<void> {
-  const due = await env.DB.prepare(
-    `SELECT id, poll_interval_minutes
-     FROM zones
-     WHERE enabled = 1
-       AND (last_scheduled_at IS NULL OR last_scheduled_at <= ? - poll_interval_minutes * 60000)
-     ORDER BY COALESCE(last_scheduled_at, 0) ASC`,
-  )
-    .bind(scheduledAt)
-    .all<{ id: string; poll_interval_minutes: number }>();
+  const collectionPaused = await d1WritesPaused(env.DB);
+  const due = collectionPaused
+    ? { results: [] as Array<{ id: string; poll_interval_minutes: number }> }
+    : await env.DB.prepare(
+      `SELECT id, poll_interval_minutes
+       FROM zones
+       WHERE enabled = 1
+         AND (last_scheduled_at IS NULL OR last_scheduled_at <= ? - poll_interval_minutes * 60000)
+       ORDER BY COALESCE(last_scheduled_at, 0) ASC`,
+    )
+      .bind(scheduledAt)
+      .all<{ id: string; poll_interval_minutes: number }>();
 
   let sent = 0;
   for (const zone of due.results) {
@@ -91,7 +93,7 @@ export async function dispatchScheduled(env: Env, scheduledAt = nowMs()): Promis
       .run();
   }
 
-  if (new Date(scheduledAt).getUTCMinutes() === 12) {
+  if (!collectionPaused && new Date(scheduledAt).getUTCMinutes() === 12) {
     await enqueueHourlyRepairs(env, scheduledAt);
   }
   if (new Date(scheduledAt).getUTCMinutes() === 42) {
@@ -101,7 +103,22 @@ export async function dispatchScheduled(env: Env, scheduledAt = nowMs()): Promis
   await incrementUsage(env.DB, { workerInvocations: 1, queueMessages: sent });
 }
 
-export async function processCollectJob(env: Env, job: Extract<CollectorJob, { type: "collect" }>): Promise<void> {
+export async function processCollectJob(
+  env: Env,
+  job: Extract<CollectorJob, { type: "collect" }>,
+): Promise<"collected" | "budget-paused"> {
+  if (await d1WritesPaused(env.DB)) {
+    // 预算暂停属于主动背压，不应进入失败重试；回填任务需释放调度时取得的游标租约。
+    if (job.mode !== "repair") {
+      await env.DB.prepare(
+        `UPDATE sync_cursors SET in_flight_until = NULL, updated_at = ?
+         WHERE zone_id = ? AND dataset = ?`,
+      )
+        .bind(nowMs(), job.zoneId, job.dataset)
+        .run();
+    }
+    return "budget-paused";
+  }
   const startedAt = nowMs();
   const stats: CollectStats = { queries: 0, returned: 0, inserted: 0, saturatedWindows: 0 };
   await env.DB.prepare(
@@ -112,7 +129,6 @@ export async function processCollectJob(env: Env, job: Extract<CollectorJob, { t
     .bind(job.id, job.parentId ?? null, job.zoneId, job.dataset, job.mode, job.start, job.end, startedAt)
     .run();
   try {
-    if (await d1WritesPaused(env.DB)) throw new Error("D1 当日写入预算已达到 80%，采集游标保持不变");
     const capability = await getCapability(env.DB, job.zoneId, job.dataset);
     if (!capability?.enabled) throw new Error(`${job.dataset} 当前不可用`);
     await collectWindow(env, capability, job.start, job.end, job.id, stats, 0);
@@ -125,6 +141,7 @@ export async function processCollectJob(env: Env, job: Extract<CollectorJob, { t
         .run();
     }
     await finishRun(env.DB, job.id, "success", stats, null);
+    return "collected";
   } catch (error) {
     const message = sanitizeError(error);
     await Promise.all([
@@ -453,14 +470,6 @@ async function reserveGraphqlBudget(database: D1Database, amount: number): Promi
     .bind(key)
     .first<{ value: number }>();
   return (row?.value ?? 1) <= GRAPHQL_BUDGET_PER_FIVE_MINUTES;
-}
-
-async function d1WritesPaused(database: D1Database): Promise<boolean> {
-  const day = new Date().toISOString().slice(0, 10);
-  const usage = await database.prepare("SELECT d1_rows_written FROM usage_daily WHERE day = ?")
-    .bind(day)
-    .first<{ d1_rows_written: number }>();
-  return (usage?.d1_rows_written ?? 0) >= D1_DAILY_WRITE_PAUSE;
 }
 
 async function finishRun(

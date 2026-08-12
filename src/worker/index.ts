@@ -38,8 +38,12 @@ export default {
         continue;
       }
       try {
-        if (parsed.data.type === "collect") await processCollectJob(env, parsed.data);
-        else await runMaintenance(env, parsed.data.scheduledAt);
+        if (parsed.data.type === "collect") {
+          const outcome = await processCollectJob(env, parsed.data);
+          if (outcome === "budget-paused") {
+            console.info(JSON.stringify({ event: "collection_budget_paused", jobId: parsed.data.id }));
+          }
+        } else await runMaintenance(env, parsed.data.scheduledAt);
         message.ack();
       } catch (error) {
         console.error(JSON.stringify({ event: "queue_job_failed", jobId: parsed.data.id, error: sanitizeError(error) }));
