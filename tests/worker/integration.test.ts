@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { env, exports } from "cloudflare:workers";
-import { processCollectJob, retryDelay } from "@/worker/collector";
+import { oldestQueryableAt, processCollectJob, retryDelay } from "@/worker/collector";
 import { runMaintenance } from "@/worker/archive";
 import { csvCell, estimateDailyQueueOperations } from "@/worker/api";
 import { dotStuff, mimeMessage } from "@/worker/smtp";
@@ -127,6 +127,18 @@ describe("Worker API 与存储", () => {
 });
 
 describe("安全边界与协议细节", () => {
+  it("首次回填避开 Cloudflare 滚动保留窗口边界", () => {
+    const scheduledAt = Date.UTC(2026, 7, 12, 8, 0);
+    expect(oldestQueryableAt(scheduledAt, 8 * 86_400)).toBe(
+      scheduledAt - 8 * 86_400_000 + 15 * 60_000,
+    );
+  });
+
+  it("极短可回看窗口不会越过稳定数据终点", () => {
+    const scheduledAt = Date.UTC(2026, 7, 12, 8, 0);
+    expect(oldestQueryableAt(scheduledAt, 60)).toBe(scheduledAt - 5 * 60_000);
+  });
+
   it("Queue 预算估算包含四数据集实时任务和每小时修复", () => {
     expect(estimateDailyQueueOperations([{ enabled: true, pollIntervalMinutes: 5 }])).toBe(3_744);
     expect(estimateDailyQueueOperations([{ enabled: false, pollIntervalMinutes: 1 }])).toBe(0);

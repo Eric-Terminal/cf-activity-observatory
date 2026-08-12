@@ -23,6 +23,7 @@ import {
 } from "@/worker/utils";
 
 const DATA_DELAY_MS = 5 * MINUTE_MS;
+const RETENTION_BOUNDARY_MARGIN_MS = 15 * MINUTE_MS;
 const CAPABILITY_MAX_AGE_MS = DAY_MS;
 const MIN_SPLIT_WINDOW_MS = 1_000;
 const GRAPHQL_BUDGET_PER_FIVE_MINUTES = 240;
@@ -188,7 +189,7 @@ async function acquireWindow(
 ): Promise<{ start: number; end: number; mode: "realtime" | "backfill" } | null> {
   const stableEnd = floorTo(scheduledAt - DATA_DELAY_MS, MINUTE_MS);
   if (stableEnd <= 0) return null;
-  const oldest = stableEnd - Math.max(0, capability.notOlderThan ?? DAY_MS / 1000) * 1000;
+  const oldest = oldestQueryableAt(scheduledAt, capability.notOlderThan ?? DAY_MS / 1000);
   const timestamp = nowMs();
   await env.DB.prepare(
     `INSERT OR IGNORE INTO sync_cursors
@@ -235,6 +236,19 @@ async function acquireWindow(
     .run();
   if (!acquired.meta.changes) return null;
   return { start: cursorAt, end, mode: end < stableEnd ? "backfill" : "realtime" };
+}
+
+export function oldestQueryableAt(scheduledAt: number, notOlderThanSeconds: number): number {
+  const historyWindow = Math.max(0, notOlderThanSeconds) * 1000;
+  // Cloudflare 按请求时刻计算滚动保留边界；队列等待会让恰好贴边的首次回填在执行前过期。
+  const safetyMargin = Math.min(
+    RETENTION_BOUNDARY_MARGIN_MS,
+    Math.max(MINUTE_MS, historyWindow / 100),
+  );
+  return floorTo(
+    Math.min(scheduledAt - DATA_DELAY_MS, scheduledAt - historyWindow + safetyMargin),
+    MINUTE_MS,
+  );
 }
 
 async function collectWindow(
