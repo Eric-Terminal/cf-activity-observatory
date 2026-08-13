@@ -12,10 +12,13 @@ import { runMaintenance } from "@/worker/archive";
 import { csvCell, estimateDailyQueueOperations } from "@/worker/api";
 import { dotStuff, mimeMessage } from "@/worker/smtp";
 import { CloudflareApiError } from "@/worker/cloudflare";
-import { evaluateAlerts } from "@/worker/alerts";
+import { alertNeedsNotification, evaluateAlerts } from "@/worker/alerts";
 import worker from "@/worker/index";
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
 
 describe("Worker API 与存储", () => {
   it("公网请求没有 Access JWT 时拒绝访问", async () => {
@@ -241,7 +244,7 @@ describe("Worker API 与存储", () => {
     expect(cursors?.count).toBe(0);
   });
 
-  it("预算暂停会正常跳过队列任务并释放回填租约", async () => {
+  it("D1 预算暂停会延迟队列任务并保留回填租约", async () => {
     const timestamp = Date.now();
     await insertZone("zone-budget-consumer", "budget-consumer.example");
     await env.DB.prepare(
@@ -252,6 +255,7 @@ describe("Worker API 与存储", () => {
     await setD1Writes(80_000, timestamp);
     const fetchMock = vi.fn(() => Promise.reject(new Error("预算暂停时不应请求 Cloudflare")));
     vi.stubGlobal("fetch", fetchMock);
+    const send = vi.spyOn(env.COLLECTOR_QUEUE, "send");
 
     const outcome = await processCollectJob(env, {
       version: 1,
@@ -266,11 +270,15 @@ describe("Worker API 与存储", () => {
 
     expect(outcome).toBe("budget-paused");
     expect(fetchMock).not.toHaveBeenCalled();
+    expect(send).toHaveBeenCalledOnce();
+    expect(send.mock.calls[0]?.[1]?.delaySeconds).toBeGreaterThan(0);
     const cursor = await env.DB.prepare(
       `SELECT consecutive_failures, in_flight_until, last_error FROM sync_cursors
        WHERE zone_id = 'zone-budget-consumer' AND dataset = 'httpRequestsAdaptive'`,
     ).first<{ consecutive_failures: number; in_flight_until: number | null; last_error: string | null }>();
-    expect(cursor).toEqual({ consecutive_failures: 2, in_flight_until: null, last_error: "此前的真实错误" });
+    expect(cursor?.consecutive_failures).toBe(2);
+    expect(cursor?.last_error).toBe("此前的真实错误");
+    expect(cursor?.in_flight_until).toBeGreaterThan(timestamp);
     const run = await env.DB.prepare(
       "SELECT id FROM collector_runs WHERE id = 'budget-paused-job'",
     ).first<{ id: string }>();
@@ -305,10 +313,161 @@ describe("Worker API 与存储", () => {
     if (!message) throw new Error("队列测试消息创建失败");
     const ack = vi.spyOn(message, "ack");
     const retry = vi.spyOn(message, "retry");
+    const send = vi.spyOn(env.COLLECTOR_QUEUE, "send");
     await worker.queue(batch, env);
 
     expect(ack).toHaveBeenCalledOnce();
     expect(retry).not.toHaveBeenCalled();
+    expect(send).toHaveBeenCalledOnce();
+  });
+
+  it("GraphQL 软预算耗尽时延迟任务且不计为采集失败", async () => {
+    const timestamp = Date.now();
+    const bucket = Math.floor(timestamp / 300_000) * 300_000;
+    await insertZone("zone-graphql-budget", "graphql-budget.example");
+    await env.DB.prepare(
+      `INSERT INTO dataset_capabilities
+       (zone_id, dataset, enabled, available_fields, max_page_size, max_number_of_fields,
+        not_older_than, max_duration, checked_at)
+       VALUES ('zone-graphql-budget', 'httpRequestsAdaptive', 1, '["datetime"]', 250, 10, 604800, 3600, ?)`,
+    ).bind(timestamp).run();
+    await env.DB.prepare(
+      `INSERT INTO sync_cursors
+       (zone_id, dataset, cursor_at, last_success_at, consecutive_failures, last_error, updated_at)
+       VALUES ('zone-graphql-budget', 'httpRequestsAdaptive', ?, ?, 4, '此前错误', ?)`,
+    ).bind(timestamp - 60_000, timestamp - 120_000, timestamp).run();
+    await setD1Writes(0, timestamp);
+    await env.DB.prepare(
+      `INSERT INTO app_settings (key, value, updated_at) VALUES (?, '240', ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+    ).bind(`graphql_budget:${bucket}`, timestamp).run();
+    const fetchMock = vi.fn(() => Promise.reject(new Error("软预算耗尽时不应请求 Cloudflare")));
+    vi.stubGlobal("fetch", fetchMock);
+    const send = vi.spyOn(env.COLLECTOR_QUEUE, "send");
+
+    const outcome = await processCollectJob(env, {
+      version: 1,
+      type: "collect",
+      id: "graphql-budget-job",
+      zoneId: "zone-graphql-budget",
+      dataset: "httpRequestsAdaptive",
+      start: timestamp - 60_000,
+      end: timestamp,
+      mode: "repair",
+      budgetClass: "live",
+    });
+
+    expect(outcome).toBe("rate-paused");
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(send).toHaveBeenCalledOnce();
+    const cursor = await env.DB.prepare(
+      `SELECT consecutive_failures, last_error FROM sync_cursors
+       WHERE zone_id = 'zone-graphql-budget' AND dataset = 'httpRequestsAdaptive'`,
+    ).first<{ consecutive_failures: number; last_error: string | null }>();
+    expect(cursor).toEqual({ consecutive_failures: 4, last_error: "此前错误" });
+    expect(await env.DB.prepare(
+      "SELECT id FROM collector_runs WHERE id = 'graphql-budget-job'",
+    ).first()).toBeNull();
+  });
+
+  it("历史回填达到独立预算后暂停但实时修复仍可继续", async () => {
+    const timestamp = Date.now();
+    await insertZone("zone-backfill-budget", "backfill-budget.example");
+    await env.DB.prepare(
+      `INSERT INTO dataset_capabilities
+       (zone_id, dataset, enabled, available_fields, max_page_size, max_number_of_fields,
+        not_older_than, max_duration, checked_at)
+       VALUES ('zone-backfill-budget', 'httpRequestsAdaptive', 1, '["datetime"]', 250, 10, 604800, 3600, ?)`,
+    ).bind(timestamp).run();
+    await env.DB.prepare(
+      `INSERT INTO sync_cursors (zone_id, dataset, cursor_at, consecutive_failures, in_flight_until, updated_at)
+       VALUES ('zone-backfill-budget', 'httpRequestsAdaptive', ?, 0, ?, ?)`,
+    ).bind(timestamp - 60_000, timestamp + 15 * 60_000, timestamp).run();
+    await setD1Writes(20_000, timestamp);
+    await env.DB.prepare("DELETE FROM app_settings WHERE key LIKE 'graphql_budget:%'").run();
+    const fetchMock = vi.fn(() => Promise.resolve(new Response(JSON.stringify({
+      data: { viewer: { zones: [{ httpRequestsAdaptive: [] }] } },
+    }), { headers: { "Content-Type": "application/json" } })));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const backfill = await processCollectJob(env, {
+      version: 1,
+      type: "collect",
+      id: "backfill-budget-job",
+      zoneId: "zone-backfill-budget",
+      dataset: "httpRequestsAdaptive",
+      start: timestamp - 60_000,
+      end: timestamp,
+      mode: "backfill",
+      budgetClass: "backfill",
+    });
+    const live = await processCollectJob(env, {
+      version: 1,
+      type: "collect",
+      id: "live-budget-job",
+      zoneId: "zone-backfill-budget",
+      dataset: "httpRequestsAdaptive",
+      start: timestamp - 60_000,
+      end: timestamp,
+      mode: "repair",
+      budgetClass: "live",
+    });
+
+    expect(backfill).toBe("budget-paused");
+    expect(live).toBe("collected");
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("饱和窗口拆成两个续传任务并留下可追踪缺口", async () => {
+    const timestamp = Math.floor((Date.now() - 10 * 60_000) / 60_000) * 60_000;
+    await insertZone("zone-split", "split.example");
+    await env.DB.prepare(
+      `INSERT INTO dataset_capabilities
+       (zone_id, dataset, enabled, available_fields, max_page_size, max_number_of_fields,
+        not_older_than, max_duration, checked_at)
+       VALUES ('zone-split', 'httpRequestsAdaptive', 1, '["datetime","rayName"]', 2, 10, 604800, 3600, ?)`,
+    ).bind(Date.now()).run();
+    await env.DB.prepare(
+      `INSERT INTO sync_cursors (zone_id, dataset, cursor_at, consecutive_failures, in_flight_until, updated_at)
+       VALUES ('zone-split', 'httpRequestsAdaptive', ?, 0, ?, ?)`,
+    ).bind(timestamp, Date.now() + 15 * 60_000, Date.now()).run();
+    await setD1Writes(0);
+    await env.DB.prepare("DELETE FROM app_settings WHERE key LIKE 'graphql_budget:%'").run();
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({
+      data: { viewer: { zones: [{ httpRequestsAdaptive: [
+        { datetime: new Date(timestamp).toISOString(), rayName: "split-1" },
+        { datetime: new Date(timestamp + 1_000).toISOString(), rayName: "split-2" },
+      ] }] } },
+    }), { headers: { "Content-Type": "application/json" } }))));
+    const sendBatch = vi.spyOn(env.COLLECTOR_QUEUE, "sendBatch");
+
+    const outcome = await processCollectJob(env, {
+      version: 1,
+      type: "collect",
+      id: "split-root",
+      zoneId: "zone-split",
+      dataset: "httpRequestsAdaptive",
+      start: timestamp,
+      end: timestamp + 60_000,
+      mode: "backfill",
+      budgetClass: "backfill",
+    });
+
+    expect(outcome).toBe("split");
+    expect(sendBatch).toHaveBeenCalledOnce();
+    expect(sendBatch.mock.calls[0]?.[0]).toHaveLength(2);
+    const gaps = await env.DB.prepare(
+      `SELECT range_start, range_end, reason FROM data_gaps
+       WHERE zone_id = 'zone-split' AND resolved_at IS NULL ORDER BY range_start`,
+    ).all<{ range_start: number; range_end: number; reason: string }>();
+    expect(gaps.results).toEqual([
+      { range_start: timestamp, range_end: timestamp + 30_000, reason: "高密度窗口已拆分，等待续传任务完成" },
+      { range_start: timestamp + 30_000, range_end: timestamp + 60_000, reason: "高密度窗口已拆分，等待续传任务完成" },
+    ]);
+    const cursor = await env.DB.prepare(
+      "SELECT cursor_at, consecutive_failures FROM sync_cursors WHERE zone_id = 'zone-split' AND dataset = 'httpRequestsAdaptive'",
+    ).first<{ cursor_at: number; consecutive_failures: number }>();
+    expect(cursor).toEqual({ cursor_at: timestamp + 60_000, consecutive_failures: 0 });
   });
 
   it("Queue 消费者仍会重试真正的采集错误", async () => {
@@ -345,7 +504,7 @@ describe("Worker API 与存储", () => {
     expect(retry).toHaveBeenCalledOnce();
   });
 
-  it("预算暂停期间不会把陈旧游标重复报告为采集故障", async () => {
+  it("预算暂停期间保留已有采集故障而不发送假恢复", async () => {
     const timestamp = Date.now();
     await insertZone("zone-budget-alert", "budget-alert.example");
     await env.DB.prepare(
@@ -368,8 +527,36 @@ describe("Worker API 与存储", () => {
     ).all<{ alert_key: string; status: string }>();
     expect(alerts.results).toEqual([
       { alert_key: "budget:d1-writes", status: "active" },
-      { alert_key: "collector:zone-budget-alert:httpRequestsAdaptive", status: "recovered" },
+      { alert_key: "collector:zone-budget-alert:httpRequestsAdaptive", status: "active" },
     ]);
+  });
+
+  it("指标汇总只处理水位线后发生变化的时间桶", async () => {
+    const scheduledAt = Math.floor(Date.now() / 3_600_000) * 3_600_000;
+    const bucketStart = scheduledAt - 3_600_000;
+    await insertZone("zone-rollup", "rollup.example");
+    await setD1Writes(0);
+    await env.DB.prepare("DELETE FROM app_settings WHERE key = 'metric_rollup_watermark'").run();
+    await env.DB.prepare(
+      `INSERT INTO metric_buckets
+       (id, zone_id, bucket_start, bucket_seconds, metric_kind, dimension_signature,
+        estimated_count, updated_at)
+       VALUES ('rollup-source', 'zone-rollup', ?, 300, 'http', '{}', 12, ?)`,
+    ).bind(bucketStart, scheduledAt - 1_000).run();
+
+    await runMaintenance(env, scheduledAt);
+    const first = await env.DB.prepare(
+      `SELECT updated_at FROM metric_buckets
+       WHERE zone_id = 'zone-rollup' AND bucket_seconds = 3600 AND bucket_start = ?`,
+    ).bind(bucketStart).first<{ updated_at: number }>();
+    expect(first?.updated_at).toBe(scheduledAt);
+
+    await runMaintenance(env, scheduledAt + 3_600_000);
+    const second = await env.DB.prepare(
+      `SELECT updated_at FROM metric_buckets
+       WHERE zone_id = 'zone-rollup' AND bucket_seconds = 3600 AND bucket_start = ?`,
+    ).bind(bucketStart).first<{ updated_at: number }>();
+    expect(second?.updated_at).toBe(scheduledAt);
   });
 });
 
@@ -409,6 +596,11 @@ describe("安全边界与协议细节", () => {
   it("503 使用有上限的指数退避", () => {
     expect(retryDelay(new CloudflareApiError("temporary", null, 503), 3)).toBe(120);
     expect(retryDelay(new CloudflareApiError("temporary", null, 503), 20)).toBe(900);
+  });
+  it("持续中的同一告警发送成功后不会按小时重复通知", () => {
+    expect(alertNeedsNotification("active", Date.now() - 24 * 3_600_000, "active")).toBe(false);
+    expect(alertNeedsNotification("active", Date.now(), "recovered")).toBe(true);
+    expect(alertNeedsNotification("active", null, "active")).toBe(true);
   });
 });
 

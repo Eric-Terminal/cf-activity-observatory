@@ -40,8 +40,8 @@ export default {
       try {
         if (parsed.data.type === "collect") {
           const outcome = await processCollectJob(env, parsed.data);
-          if (outcome === "budget-paused") {
-            console.info(JSON.stringify({ event: "collection_budget_paused", jobId: parsed.data.id }));
+          if (outcome !== "collected") {
+            console.info(JSON.stringify({ event: "collection_deferred", outcome, jobId: parsed.data.id }));
           }
         } else await runMaintenance(env, parsed.data.scheduledAt);
         message.ack();
@@ -55,7 +55,16 @@ export default {
              ON CONFLICT(alert_key) DO UPDATE SET status = 'active', last_seen_at = excluded.last_seen_at,
               details = excluded.details`,
           )
-            .bind(`dlq:${parsed.data.id}`, timestamp, timestamp, JSON.stringify({ jobType: parsed.data.type, error: sanitizeError(error) }))
+            .bind(`dlq:${parsed.data.id}`, timestamp, timestamp, JSON.stringify({
+              jobType: parsed.data.type,
+              ...(parsed.data.type === "collect" ? {
+                zoneId: parsed.data.zoneId,
+                dataset: parsed.data.dataset,
+                rangeStart: parsed.data.start,
+                rangeEnd: parsed.data.end,
+              } : {}),
+              error: sanitizeError(error),
+            }))
             .run();
         }
         message.retry({ delaySeconds: retryDelay(error, message.attempts) });

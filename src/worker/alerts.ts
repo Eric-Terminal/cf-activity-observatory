@@ -4,8 +4,6 @@ import { asRecord, nowMs, sanitizeError } from "@/worker/utils";
 import { smtpConfigSchema, type SmtpConfigInput } from "@/shared/contracts";
 import { D1_DAILY_WRITE_PAUSE } from "@/worker/budgets";
 
-const ALERT_COOLDOWN_MS = 60 * 60 * 1000;
-
 interface SmtpRow {
   enabled: number;
   host: string;
@@ -69,12 +67,15 @@ export async function evaluateAlerts(env: Env): Promise<void> {
   }
   for (const [key, alert] of active) await transitionAlert(env, key, true, alert.title, alert.details, timestamp);
 
-  const open = await env.DB.prepare("SELECT alert_key FROM alert_state WHERE status = 'active'")
-    .all<{ alert_key: string }>();
+  const open = await env.DB.prepare("SELECT alert_key, details FROM alert_state WHERE status = 'active'")
+    .all<{ alert_key: string; details: string }>();
   for (const state of open.results) {
     // DLQ 没有可靠的自动清空信号；保留状态，直到运维确认并显式处理对应记录。
-    if (!state.alert_key.startsWith("dlq:") && !active.has(state.alert_key)) {
-      await transitionAlert(env, state.alert_key, false, "状态已恢复", state.alert_key, timestamp);
+    if (state.alert_key.startsWith("dlq:")) continue;
+    // 预算暂停时无法观测采集器是否已经恢复，既不新增陈旧告警，也不制造假恢复。
+    if (collectionPaused && state.alert_key.startsWith("collector:")) continue;
+    if (!active.has(state.alert_key)) {
+      await transitionAlert(env, state.alert_key, false, "状态已恢复", previousAlertTitle(state.details), timestamp);
     }
   }
 }
@@ -91,12 +92,13 @@ async function transitionAlert(
     .bind(key)
     .first<AlertStateRow>();
   const status = active ? "active" : "recovered";
-  const shouldSend = !current || current.status !== status || !current.last_sent_at || timestamp - current.last_sent_at >= ALERT_COOLDOWN_MS;
+  const shouldSend = alertNeedsNotification(current?.status ?? null, current?.last_sent_at ?? null, status);
   await env.DB.prepare(
     `INSERT INTO alert_state (alert_key, status, first_seen_at, last_seen_at, recovered_at, details)
      VALUES (?, ?, ?, ?, ?, ?)
      ON CONFLICT(alert_key) DO UPDATE SET status = excluded.status, last_seen_at = excluded.last_seen_at,
-      recovered_at = excluded.recovered_at, details = excluded.details`,
+      recovered_at = excluded.recovered_at, details = excluded.details,
+      last_sent_at = CASE WHEN alert_state.status <> excluded.status THEN NULL ELSE alert_state.last_sent_at END`,
   )
     .bind(key, status, timestamp, timestamp, active ? null : timestamp, JSON.stringify({ title, details }))
     .run();
@@ -108,6 +110,24 @@ async function transitionAlert(
     await env.DB.prepare("UPDATE alert_state SET last_sent_at = ? WHERE alert_key = ?").bind(timestamp, key).run();
   } catch (error) {
     console.error(JSON.stringify({ event: "smtp_alert_failed", alertKey: key, error: sanitizeError(error) }));
+  }
+}
+
+export function alertNeedsNotification(
+  previousStatus: string | null,
+  lastSentAt: number | null,
+  nextStatus: string,
+): boolean {
+  return previousStatus === null || previousStatus !== nextStatus || lastSentAt === null;
+}
+
+function previousAlertTitle(details: string): string {
+  try {
+    const parsed = asRecord(JSON.parse(details));
+    const title = parsed.title;
+    return typeof title === "string" && title ? `此前告警已恢复：${title}` : "此前告警已恢复。";
+  } catch {
+    return "此前告警已恢复。";
   }
 }
 

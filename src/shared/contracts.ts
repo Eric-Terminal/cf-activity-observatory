@@ -24,6 +24,7 @@ export const collectorJobSchema = z.discriminatedUnion("type", [
     start: z.number().int().nonnegative(),
     end: z.number().int().positive(),
     mode: z.enum(["realtime", "backfill", "repair"]).default("realtime"),
+    budgetClass: z.enum(["live", "backfill"]).optional(),
   }),
   z.object({
     version: z.literal(1),

@@ -7,7 +7,12 @@ import {
   type DatasetResult,
 } from "@/worker/cloudflare";
 import { getCapability, incrementUsage, recordD1Usage } from "@/worker/db";
-import { d1WritesPaused } from "@/worker/budgets";
+import {
+  D1_DAILY_BACKFILL_PAUSE,
+  D1_DAILY_WRITE_PAUSE,
+  d1RowsWrittenToday,
+  d1WritesPaused,
+} from "@/worker/budgets";
 import {
   asNumber,
   asRecord,
@@ -29,6 +34,11 @@ const MAX_COLLECTION_WINDOW_MS = HOUR_MS;
 const CAPABILITY_MAX_AGE_MS = DAY_MS;
 const MIN_SPLIT_WINDOW_MS = 1_000;
 const GRAPHQL_BUDGET_PER_FIVE_MINUTES = 240;
+const SPLIT_GAP_REASON = "高密度窗口已拆分，等待续传任务完成";
+const BUDGET_GAP_REASON = "D1 写入预算暂停，等待下个 UTC 日自动补采";
+
+type CollectOutcome = "collected" | "split" | "budget-paused" | "rate-paused";
+
 interface CollectStats {
   queries: number;
   returned: number;
@@ -38,6 +48,8 @@ interface CollectStats {
 
 export async function dispatchScheduled(env: Env, scheduledAt = nowMs()): Promise<void> {
   const collectionPaused = await d1WritesPaused(env.DB);
+  if (collectionPaused) await rememberPausedWindow(env.DB, scheduledAt);
+  else await enqueuePausedRepairs(env, scheduledAt);
   const due = collectionPaused
     ? { results: [] as Array<{ id: string; poll_interval_minutes: number }> }
     : await env.DB.prepare(
@@ -71,6 +83,7 @@ export async function dispatchScheduled(env: Env, scheduledAt = nowMs()): Promis
             start: liveStart,
             end: liveEnd,
             mode: "repair",
+            budgetClass: "live",
           });
           sent += 1;
         }
@@ -84,6 +97,7 @@ export async function dispatchScheduled(env: Env, scheduledAt = nowMs()): Promis
         start: acquired.start,
         end: acquired.end,
         mode: acquired.mode,
+        budgetClass: acquired.mode === "backfill" ? "backfill" : "live",
       };
       await env.COLLECTOR_QUEUE.send(job);
       sent += 1;
@@ -100,48 +114,46 @@ export async function dispatchScheduled(env: Env, scheduledAt = nowMs()): Promis
     await env.COLLECTOR_QUEUE.send({ version: 1, type: "maintenance", id: crypto.randomUUID(), scheduledAt });
     sent += 1;
   }
-  await incrementUsage(env.DB, { workerInvocations: 1, queueMessages: sent });
+  // 进入写入保护后，空 Cron 不再为了记账继续消耗 D1；真正发送维护任务时仍保留统计。
+  if (!collectionPaused || sent > 0) {
+    await incrementUsage(env.DB, { workerInvocations: 1, queueMessages: sent });
+  }
 }
 
 export async function processCollectJob(
   env: Env,
   job: Extract<CollectorJob, { type: "collect" }>,
-): Promise<"collected" | "budget-paused"> {
-  if (await d1WritesPaused(env.DB)) {
-    // 预算暂停属于主动背压，不应进入失败重试；回填任务需释放调度时取得的游标租约。
-    if (job.mode !== "repair") {
-      await env.DB.prepare(
-        `UPDATE sync_cursors SET in_flight_until = NULL, updated_at = ?
-         WHERE zone_id = ? AND dataset = ?`,
-      )
-        .bind(nowMs(), job.zoneId, job.dataset)
-        .run();
-    }
+): Promise<CollectOutcome> {
+  const rowsWritten = await d1RowsWrittenToday(env.DB);
+  const budgetClass = job.budgetClass ?? (job.mode === "backfill" ? "backfill" : "live");
+  if (rowsWritten >= D1_DAILY_WRITE_PAUSE || (budgetClass === "backfill" && rowsWritten >= D1_DAILY_BACKFILL_PAUSE)) {
+    await deferCollectJob(env, job, secondsUntilUtcReset(nowMs()));
     return "budget-paused";
   }
   const startedAt = nowMs();
   const stats: CollectStats = { queries: 0, returned: 0, inserted: 0, saturatedWindows: 0 };
-  await env.DB.prepare(
-    `INSERT OR REPLACE INTO collector_runs
-       (id, parent_id, zone_id, dataset, job_type, range_start, range_end, status, started_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?)`,
-  )
-    .bind(job.id, job.parentId ?? null, job.zoneId, job.dataset, job.mode, job.start, job.end, startedAt)
-    .run();
   try {
     const capability = await getCapability(env.DB, job.zoneId, job.dataset);
     if (!capability?.enabled) throw new Error(`${job.dataset} 当前不可用`);
-    await collectWindow(env, capability, job.start, job.end, job.id, stats, 0);
-    if (job.mode !== "repair") {
-      await env.DB.prepare(
-        `UPDATE sync_cursors SET cursor_at = MAX(cursor_at, ?), last_success_at = ?, consecutive_failures = 0,
-          in_flight_until = NULL, last_error = NULL, updated_at = ? WHERE zone_id = ? AND dataset = ?`,
-      )
-        .bind(job.end, nowMs(), nowMs(), job.zoneId, job.dataset)
-        .run();
+    const maximumWindow = collectionWindowDuration(capability.maxDuration);
+    if (job.end - job.start > maximumWindow) {
+      await startRun(env.DB, job, startedAt);
+      await enqueueSplitWindows(env, job);
+      await advanceCursor(env.DB, job);
+      await finishRun(env.DB, job.id, "split", stats, null);
+      await resolveJobAlert(env.DB, job.id);
+      return "split";
     }
-    await finishRun(env.DB, job.id, "success", stats, null);
-    return "collected";
+    if (!(await reserveGraphqlBudget(env.DB, expectedGraphqlQueries(job.dataset)))) {
+      await deferCollectJob(env, job, secondsUntilNextGraphqlBucket(nowMs()));
+      return "rate-paused";
+    }
+    await startRun(env.DB, job, startedAt);
+    const result = await collectWindow(env, capability, job, stats);
+    await advanceCursor(env.DB, job);
+    await finishRun(env.DB, job.id, result === "split" ? "split" : "success", stats, null);
+    await resolveJobAlert(env.DB, job.id);
+    return result === "split" ? "split" : "collected";
   } catch (error) {
     const message = sanitizeError(error);
     await Promise.all([
@@ -281,24 +293,17 @@ export function collectionWindowDuration(maxDurationSeconds: number | null): num
 async function collectWindow(
   env: Env,
   capability: DatasetCapability,
-  start: number,
-  end: number,
-  batchId: string,
+  job: Extract<CollectorJob, { type: "collect" }>,
   stats: CollectStats,
-  depth: number,
-): Promise<void> {
-  const expectedQueries = GROUP_DATASETS.includes(capability.dataset as (typeof GROUP_DATASETS)[number]) ? 5 : 1;
-  if (!(await reserveGraphqlBudget(env.DB, expectedQueries))) throw new CloudflareApiError("GraphQL 五分钟调用预算已用尽", 60, 429);
-  const result = await fetchDatasetWindow(env, capability, start, end);
+): Promise<"complete" | "split"> {
+  const result = await fetchDatasetWindow(env, capability, job.start, job.end);
   stats.queries += result.queryCount;
   stats.returned += result.rows.length;
   await incrementUsage(env.DB, { graphqlQueries: result.queryCount });
-  if (result.saturated && end - start > MIN_SPLIT_WINDOW_MS && depth < 20) {
+  if (result.saturated && job.end - job.start > MIN_SPLIT_WINDOW_MS) {
     stats.saturatedWindows += 1;
-    const middle = floorTo(start + (end - start) / 2, MIN_SPLIT_WINDOW_MS);
-    await collectWindow(env, capability, start, middle, batchId, stats, depth + 1);
-    await collectWindow(env, capability, middle, end, batchId, stats, depth + 1);
-    return;
+    await enqueueSplitWindows(env, job);
+    return "split";
   }
   if (result.saturated) {
     const detectedAt = nowMs();
@@ -308,17 +313,17 @@ async function collectWindow(
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
     )
       .bind(
-        stableId(capability.zoneId, capability.dataset, start, end, "saturated"),
+        stableId(capability.zoneId, capability.dataset, job.start, job.end, "saturated"),
         capability.zoneId,
         capability.dataset,
-        start,
-        end,
+        job.start,
+        job.end,
         "最小时间窗口仍达到 API 行数上限，无法保证采样明细完整",
         detectedAt,
       )
       .run();
   }
-  stats.inserted += await persistRows(env.DB, capability.dataset, capability.zoneId, result, batchId);
+  stats.inserted += await persistRows(env.DB, capability.dataset, capability.zoneId, result, job.id);
   if (!result.saturated) {
     // 完整查询覆盖缺口后才关闭它；更大的小时修复窗口也能修复先前切分出的叶子区间。
     await env.DB.prepare(
@@ -326,9 +331,10 @@ async function collectWindow(
        WHERE zone_id = ? AND dataset = ? AND range_start >= ? AND range_end <= ?
          AND resolved_at IS NULL AND acknowledged_at IS NULL`,
     )
-      .bind(nowMs(), capability.zoneId, capability.dataset, start, end)
+      .bind(nowMs(), capability.zoneId, capability.dataset, job.start, job.end)
       .run();
   }
+  return "complete";
 }
 
 async function persistRows(
@@ -440,7 +446,15 @@ function metricStatement(database: D1Database, dataset: DatasetName, zoneId: str
       estimated_count = excluded.estimated_count, sample_interval = excluded.sample_interval,
       confidence_estimate = excluded.confidence_estimate, confidence_lower = excluded.confidence_lower,
       confidence_upper = excluded.confidence_upper, confidence_sample_size = excluded.confidence_sample_size,
-      edge_response_bytes = excluded.edge_response_bytes, visits = excluded.visits, updated_at = excluded.updated_at`,
+      edge_response_bytes = excluded.edge_response_bytes, visits = excluded.visits, updated_at = excluded.updated_at
+     WHERE metric_buckets.estimated_count IS NOT excluded.estimated_count
+        OR metric_buckets.sample_interval IS NOT excluded.sample_interval
+        OR metric_buckets.confidence_estimate IS NOT excluded.confidence_estimate
+        OR metric_buckets.confidence_lower IS NOT excluded.confidence_lower
+        OR metric_buckets.confidence_upper IS NOT excluded.confidence_upper
+        OR metric_buckets.confidence_sample_size IS NOT excluded.confidence_sample_size
+        OR metric_buckets.edge_response_bytes IS NOT excluded.edge_response_bytes
+        OR metric_buckets.visits IS NOT excluded.visits`,
   ).bind(
     id, zoneId, bucketStart, bucketSeconds, metricKind, signature, asString(dimensions.clientRequestHTTPHost),
     asString(dimensions.clientCountryName), asNumber(dimensions.clientAsn), asString(dimensions.clientRequestHTTPMethodName),
@@ -486,7 +500,7 @@ async function reserveGraphqlBudget(database: D1Database, amount: number): Promi
 async function finishRun(
   database: D1Database,
   id: string,
-  status: "success" | "failed",
+  status: "success" | "split" | "failed",
   stats: CollectStats,
   error: string | null,
 ): Promise<void> {
@@ -517,6 +531,7 @@ async function enqueueHourlyRepairs(env: Env, scheduledAt: number): Promise<void
       start,
       end,
       mode: "repair",
+      budgetClass: "live",
     });
     sent += 1;
   }
@@ -526,4 +541,195 @@ async function enqueueHourlyRepairs(env: Env, scheduledAt: number): Promise<void
 export function retryDelay(error: unknown, attempts: number): number {
   if (error instanceof CloudflareApiError && error.retryAfterSeconds) return Math.min(error.retryAfterSeconds, 900);
   return Math.min(2 ** Math.max(0, attempts) * 15, 900);
+}
+
+async function startRun(
+  database: D1Database,
+  job: Extract<CollectorJob, { type: "collect" }>,
+  startedAt: number,
+): Promise<void> {
+  await database.prepare(
+    `INSERT OR REPLACE INTO collector_runs
+       (id, parent_id, zone_id, dataset, job_type, range_start, range_end, status, started_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?)`,
+  )
+    .bind(job.id, job.parentId ?? null, job.zoneId, job.dataset, job.mode, job.start, job.end, startedAt)
+    .run();
+}
+
+async function advanceCursor(
+  database: D1Database,
+  job: Extract<CollectorJob, { type: "collect" }>,
+): Promise<void> {
+  if (job.mode === "repair") return;
+  const timestamp = nowMs();
+  await database.prepare(
+    `UPDATE sync_cursors SET cursor_at = MAX(cursor_at, ?), last_success_at = ?, consecutive_failures = 0,
+      in_flight_until = NULL, last_error = NULL, updated_at = ? WHERE zone_id = ? AND dataset = ?`,
+  )
+    .bind(job.end, timestamp, timestamp, job.zoneId, job.dataset)
+    .run();
+}
+
+async function enqueueSplitWindows(
+  env: Env,
+  job: Extract<CollectorJob, { type: "collect" }>,
+): Promise<void> {
+  const middle = floorTo(job.start + (job.end - job.start) / 2, MIN_SPLIT_WINDOW_MS);
+  const ranges = [[job.start, middle], [middle, job.end]] as const;
+  const timestamp = nowMs();
+  const children = ranges.map(([start, end]) => ({
+    version: 1 as const,
+    type: "collect" as const,
+    id: stableId("split-job", job.zoneId, job.dataset, start, end),
+    parentId: job.id,
+    zoneId: job.zoneId,
+    dataset: job.dataset,
+    start,
+    end,
+    mode: "repair" as const,
+    budgetClass: job.budgetClass ?? (job.mode === "backfill" ? "backfill" as const : "live" as const),
+  }));
+  const gapStatements = [
+    env.DB.prepare(
+      `UPDATE data_gaps SET resolved_at = ?
+       WHERE zone_id = ? AND dataset = ? AND range_start >= ? AND range_end <= ?
+         AND resolved_at IS NULL AND acknowledged_at IS NULL`,
+    ).bind(timestamp, job.zoneId, job.dataset, job.start, job.end),
+    ...children.map((child) => env.DB.prepare(
+      `INSERT OR IGNORE INTO data_gaps
+       (id, zone_id, dataset, range_start, range_end, reason, detected_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(
+      stableId("split-gap", child.zoneId, child.dataset, child.start, child.end),
+      child.zoneId,
+      child.dataset,
+      child.start,
+      child.end,
+      SPLIT_GAP_REASON,
+      timestamp,
+    )),
+  ];
+  await env.DB.batch(gapStatements);
+  await env.COLLECTOR_QUEUE.sendBatch(children.map((body) => ({ body })));
+  await incrementUsage(env.DB, { queueMessages: children.length });
+}
+
+async function deferCollectJob(
+  env: Env,
+  job: Extract<CollectorJob, { type: "collect" }>,
+  delaySeconds: number,
+): Promise<void> {
+  await env.COLLECTOR_QUEUE.send(job, { delaySeconds });
+  if (job.mode !== "repair") {
+    const timestamp = nowMs();
+    await env.DB.prepare(
+      `UPDATE sync_cursors SET in_flight_until = ?, updated_at = ?
+       WHERE zone_id = ? AND dataset = ?`,
+    )
+      .bind(timestamp + (delaySeconds + 15 * 60) * 1000, timestamp, job.zoneId, job.dataset)
+      .run();
+  }
+  await incrementUsage(env.DB, { queueMessages: 1 });
+}
+
+function expectedGraphqlQueries(dataset: DatasetName): number {
+  return GROUP_DATASETS.includes(dataset as (typeof GROUP_DATASETS)[number]) ? 5 : 1;
+}
+
+function secondsUntilNextGraphqlBucket(timestamp: number): number {
+  const next = floorTo(timestamp, 5 * MINUTE_MS) + 5 * MINUTE_MS;
+  return Math.max(5, Math.ceil((next - timestamp) / 1000) + 5);
+}
+
+function secondsUntilUtcReset(timestamp: number): number {
+  const date = new Date(timestamp);
+  const next = Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate() + 1);
+  return Math.min(24 * 60 * 60, Math.max(60, Math.ceil((next - timestamp) / 1000) + 30));
+}
+
+async function rememberPausedWindow(database: D1Database, scheduledAt: number): Promise<void> {
+  const day = new Date(scheduledAt).toISOString().slice(0, 10);
+  const key = `collection_pause:${day}`;
+  const stableEnd = floorTo(scheduledAt - DATA_DELAY_MS, MINUTE_MS);
+  const inserted = await database.prepare(
+    "INSERT OR IGNORE INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)",
+  )
+    .bind(key, JSON.stringify({ start: stableEnd }), scheduledAt)
+    .run();
+  if (!inserted.meta.changes) return;
+  const latest = await database.prepare(
+    `SELECT MIN(latest) AS latest FROM (
+       SELECT MAX(occurred_at) AS latest FROM request_samples
+       UNION ALL SELECT MAX(occurred_at) FROM security_events
+       UNION ALL SELECT MAX(bucket_start) FROM metric_buckets WHERE bucket_seconds = 300
+     ) WHERE latest IS NOT NULL`,
+  ).first<{ latest: number | null }>();
+  const start = Math.min(stableEnd, latest?.latest ?? stableEnd);
+  await database.prepare("UPDATE app_settings SET value = ?, updated_at = ? WHERE key = ?")
+    .bind(JSON.stringify({ start }), scheduledAt, key)
+    .run();
+}
+
+async function enqueuePausedRepairs(env: Env, scheduledAt: number): Promise<void> {
+  const markers = await env.DB.prepare(
+    "SELECT key, value FROM app_settings WHERE key LIKE 'collection_pause:%' ORDER BY key",
+  ).all<{ key: string; value: string }>();
+  if (!markers.results.length) return;
+  const capabilities = await env.DB.prepare(
+    `SELECT c.zone_id, c.dataset FROM dataset_capabilities c
+     JOIN zones z ON z.id = c.zone_id WHERE z.enabled = 1 AND c.enabled = 1`,
+  ).all<{ zone_id: string; dataset: string }>();
+  const end = floorTo(scheduledAt - DATA_DELAY_MS, MINUTE_MS);
+  for (const marker of markers.results) {
+    const parsed = asRecord(JSON.parse(marker.value));
+    const start = asNumber(parsed.start);
+    if (start === null || start >= end) {
+      await env.DB.prepare("DELETE FROM app_settings WHERE key = ?").bind(marker.key).run();
+      continue;
+    }
+    const jobs = capabilities.results.flatMap((capability) => {
+      if (!DATASETS.includes(capability.dataset as DatasetName)) return [];
+      const dataset = capability.dataset as DatasetName;
+      return [{
+        version: 1 as const,
+        type: "collect" as const,
+        id: stableId("budget-resume", capability.zone_id, dataset, start, end),
+        zoneId: capability.zone_id,
+        dataset,
+        start,
+        end,
+        mode: "repair" as const,
+        budgetClass: "live" as const,
+      }];
+    });
+    if (jobs.length) {
+      await env.DB.batch(jobs.map((job) => env.DB.prepare(
+        `INSERT OR IGNORE INTO data_gaps
+         (id, zone_id, dataset, range_start, range_end, reason, detected_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ).bind(
+        stableId("budget-gap", job.zoneId, job.dataset, start, end),
+        job.zoneId,
+        job.dataset,
+        start,
+        end,
+        BUDGET_GAP_REASON,
+        scheduledAt,
+      )));
+      await env.COLLECTOR_QUEUE.sendBatch(jobs.map((body) => ({ body })));
+      await incrementUsage(env.DB, { queueMessages: jobs.length });
+    }
+    await env.DB.prepare("DELETE FROM app_settings WHERE key = ?").bind(marker.key).run();
+  }
+}
+
+async function resolveJobAlert(database: D1Database, jobId: string): Promise<void> {
+  const timestamp = nowMs();
+  await database.prepare(
+    `UPDATE alert_state SET status = 'recovered', recovered_at = ?, last_seen_at = ?
+     WHERE alert_key = ? AND status = 'active'`,
+  )
+    .bind(timestamp, timestamp, `dlq:${jobId}`)
+    .run();
 }
