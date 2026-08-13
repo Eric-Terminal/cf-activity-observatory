@@ -1,4 +1,4 @@
--- 趋势数据在任一时间段只保留一种粒度；迁移时删除近期小时/每日重复副本，保留老数据唯一可用的层级。
+-- 趋势数据在任一序列、时间段只保留一种粒度；旧采集器已删除的五分钟排名必须由小时层接续。
 CREATE TABLE metric_buckets_next (
   zone_id TEXT NOT NULL REFERENCES zones(id) ON DELETE CASCADE,
   bucket_start INTEGER NOT NULL,
@@ -78,6 +78,9 @@ WITH normalized AS (
     updated_at
   FROM metric_buckets
   WHERE (bucket_seconds = 300 AND bucket_start >= (unixepoch() * 1000 - 90 * 86400000))
+     OR (bucket_seconds = 3600
+         AND dimension_type IS NOT NULL
+         AND bucket_start >= (unixepoch() * 1000 - 90 * 86400000))
      OR (bucket_seconds = 3600
          AND bucket_start < (unixepoch() * 1000 - 90 * 86400000)
          AND bucket_start >= (unixepoch() * 1000 - 730 * 86400000))

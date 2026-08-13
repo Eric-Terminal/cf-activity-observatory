@@ -244,6 +244,43 @@ describe("Worker API 与存储", () => {
     expect(paths.series[0]?.points[0]?.estimated_count).toBe(20);
   });
 
+  it("高基数查询可连续读取旧小时排名与新五分钟排名", async () => {
+    const hourStart = Math.floor((Date.now() - 3 * 3_600_000) / 3_600_000) * 3_600_000;
+    await insertZone("zone-ranking-transition", "ranking-transition.example");
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO metric_buckets
+         (zone_id, bucket_start, bucket_seconds, metric_kind, dimension_signature,
+          dimension_type, dimension_value, estimated_count, updated_at)
+         VALUES ('zone-ranking-transition', ?, 3600, 'http', 'legacy-hour', 'path', '/mixed', 7, ?)`,
+      ).bind(hourStart, Date.now()),
+      env.DB.prepare(
+        `INSERT INTO metric_buckets
+         (zone_id, bucket_start, bucket_seconds, metric_kind, dimension_signature,
+          dimension_type, dimension_value, estimated_count, updated_at)
+         VALUES ('zone-ranking-transition', ?, 300, 'http', 'current-five-minutes', 'path', '/mixed', 5, ?)`,
+      ).bind(hourStart + 3_900_000, Date.now()),
+    ]);
+    const url = new URL("http://localhost/api/v1/metrics");
+    url.searchParams.set("kind", "http");
+    url.searchParams.set("dimension", "path");
+    url.searchParams.set("zones", "zone-ranking-transition");
+    url.searchParams.set("from", new Date(hourStart).toISOString());
+    url.searchParams.set("to", new Date(hourStart + 7_200_000).toISOString());
+
+    const response = await exports.default.fetch(url.toString());
+    const body = await response.json<{
+      bucketSeconds: number;
+      series: Array<{ name: string; points: Array<{ estimated_count: number }> }>;
+    }>();
+
+    expect(body.bucketSeconds).toBe(3600);
+    expect(body.series).toEqual([{
+      name: "/mixed",
+      points: [expect.objectContaining({ estimated_count: 7 }), expect.objectContaining({ estimated_count: 5 })],
+    }]);
+  });
+
   it("归档经 R2 校验后写入 verified manifest", async () => {
     const occurredAt = Math.floor((Date.now() - 3 * 3_600_000) / 3_600_000) * 3_600_000;
     await insertZone("zone-archive", "archive.example");
