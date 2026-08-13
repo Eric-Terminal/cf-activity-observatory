@@ -21,6 +21,22 @@ afterEach(() => {
 });
 
 describe("Worker API 与存储", () => {
+  it("指标表只保留复合主键和一棵查询索引", async () => {
+    const table = await env.DB.prepare(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'metric_buckets'",
+    ).first<{ sql: string }>();
+    const indexes = await env.DB.prepare(
+      `SELECT name FROM sqlite_master
+       WHERE type = 'index' AND tbl_name = 'metric_buckets' AND name NOT LIKE 'sqlite_autoindex%'
+       ORDER BY name`,
+    ).all<{ name: string }>();
+    const columns = await env.DB.prepare("PRAGMA table_info(metric_buckets)").all<{ name: string }>();
+
+    expect(table?.sql).toContain("WITHOUT ROWID");
+    expect(columns.results.map((column) => column.name)).not.toContain("id");
+    expect(indexes.results).toEqual([{ name: "metric_buckets_query_idx" }]);
+  });
+
   it("公网请求没有 Access JWT 时拒绝访问", async () => {
     const response = await exports.default.fetch("https://observatory.example/api/v1/health");
     expect(response.status).toBe(401);
@@ -153,7 +169,7 @@ describe("Worker API 与存储", () => {
   });
 
   it("聚合总量不会重复计入高基数排名 cube", async () => {
-    const timestamp = Math.floor((Date.now() - 3 * 3_600_000) / 300_000) * 300_000;
+    const timestamp = Math.floor((Date.now() - 3 * 3_600_000) / 3_600_000) * 3_600_000 + 300_000;
     await insertZone("zone-metrics", "metrics.example");
     await env.DB.prepare(
       `INSERT INTO dataset_capabilities
@@ -174,7 +190,14 @@ describe("Worker API 与存储", () => {
         ? { datetimeFiveMinutes: new Date(timestamp).toISOString(), clientRequestPath: "/ranked" }
         : { datetimeFiveMinutes: new Date(timestamp).toISOString(), clientRequestHTTPHost: "metrics.example" };
       return Promise.resolve(new Response(JSON.stringify({
-        data: { viewer: { zones: [{ httpRequestsAdaptiveGroups: [{ dimensions, count: 10, avg: { sampleInterval: 1 } }] }] } },
+        data: { viewer: { zones: [{ httpRequestsAdaptiveGroups: [
+          { dimensions, count: 10, avg: { sampleInterval: 1 } },
+          {
+            dimensions: { ...dimensions, datetimeFiveMinutes: new Date(timestamp + 300_000).toISOString() },
+            count: 10,
+            avg: { sampleInterval: 1 },
+          },
+        ] }] } },
       }), { headers: { "Content-Type": "application/json" } }));
     }));
     await processCollectJob(env, {
@@ -188,26 +211,37 @@ describe("Worker API 与存储", () => {
       mode: "repair",
     });
     const stored = await env.DB.prepare(
-      "SELECT dimension_type, dimension_value FROM metric_buckets WHERE zone_id = 'zone-metrics' AND bucket_seconds = 300 ORDER BY dimension_type",
-    ).all<{ dimension_type: string | null; dimension_value: string | null }>();
+      `SELECT dimension_type, dimension_value, COUNT(*) AS bucket_count,
+        COUNT(DISTINCT dimension_signature) AS signature_count
+       FROM metric_buckets WHERE zone_id = 'zone-metrics' AND bucket_seconds = 300
+       GROUP BY dimension_type, dimension_value ORDER BY dimension_type`,
+    ).all<{ dimension_type: string | null; dimension_value: string | null; bucket_count: number; signature_count: number }>();
     expect(stored.results).toEqual([
-      { dimension_type: null, dimension_value: null },
-      { dimension_type: "path", dimension_value: "/ranked" },
+      { dimension_type: null, dimension_value: null, bucket_count: 2, signature_count: 1 },
+      { dimension_type: "path", dimension_value: "/ranked", bucket_count: 2, signature_count: 1 },
     ]);
     const repairedGap = await env.DB.prepare(
       "SELECT resolved_at FROM data_gaps WHERE id = 'repairable-gap'",
     ).first<{ resolved_at: number | null }>();
     expect(repairedGap?.resolved_at).not.toBeNull();
     await runMaintenance(env);
+    const storedTiers = await env.DB.prepare(
+      "SELECT DISTINCT bucket_seconds FROM metric_buckets WHERE zone_id = 'zone-metrics' ORDER BY bucket_seconds",
+    ).all<{ bucket_seconds: number }>();
+    expect(storedTiers.results).toEqual([{ bucket_seconds: 300 }]);
 
     const range = `from=${encodeURIComponent(new Date(timestamp - 3_600_000).toISOString())}&to=${encodeURIComponent(new Date(timestamp + 3_600_000).toISOString())}`;
     const totalResponse = await exports.default.fetch(`http://localhost/api/v1/metrics?kind=http&dimension=total&${range}`);
     const total = await totalResponse.json<{ series: Array<{ points: Array<{ estimated_count: number }> }> }>();
-    expect(total.series[0]?.points[0]?.estimated_count).toBe(10);
+    expect(total.series[0]?.points.reduce((sum, point) => sum + point.estimated_count, 0)).toBe(20);
     const pathResponse = await exports.default.fetch(`http://localhost/api/v1/metrics?kind=http&dimension=path&${range}`);
-    const paths = await pathResponse.json<{ bucketSeconds: number; series: Array<{ name: string }> }>();
+    const paths = await pathResponse.json<{
+      bucketSeconds: number;
+      series: Array<{ name: string; points: Array<{ estimated_count: number }> }>;
+    }>();
     expect(paths.bucketSeconds).toBe(3600);
     expect(paths.series[0]?.name).toBe("/ranked");
+    expect(paths.series[0]?.points[0]?.estimated_count).toBe(20);
   });
 
   it("归档经 R2 校验后写入 verified manifest", async () => {
@@ -531,32 +565,68 @@ describe("Worker API 与存储", () => {
     ]);
   });
 
-  it("指标汇总只处理水位线后发生变化的时间桶", async () => {
+  it("指标超过保留边界后原子替换为唯一小时副本", async () => {
     const scheduledAt = Math.floor(Date.now() / 3_600_000) * 3_600_000;
-    const bucketStart = scheduledAt - 3_600_000;
+    const bucketStart = scheduledAt - 91 * 86_400_000;
     await insertZone("zone-rollup", "rollup.example");
     await setD1Writes(0);
-    await env.DB.prepare("DELETE FROM app_settings WHERE key = 'metric_rollup_watermark'").run();
-    await env.DB.prepare(
-      `INSERT INTO metric_buckets
-       (id, zone_id, bucket_start, bucket_seconds, metric_kind, dimension_signature,
-        estimated_count, updated_at)
-       VALUES ('rollup-source', 'zone-rollup', ?, 300, 'http', '{}', 12, ?)`,
-    ).bind(bucketStart, scheduledAt - 1_000).run();
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO metric_buckets
+         (zone_id, bucket_start, bucket_seconds, metric_kind, dimension_signature,
+          estimated_count, updated_at)
+         VALUES ('zone-rollup', ?, 300, 'http', '{}', 5, ?)`,
+      ).bind(bucketStart, scheduledAt - 1_000),
+      env.DB.prepare(
+        `INSERT INTO metric_buckets
+         (zone_id, bucket_start, bucket_seconds, metric_kind, dimension_signature,
+          estimated_count, updated_at)
+         VALUES ('zone-rollup', ?, 300, 'http', '{}', 7, ?)`,
+      ).bind(bucketStart + 300_000, scheduledAt - 1_000),
+    ]);
 
     await runMaintenance(env, scheduledAt);
     const first = await env.DB.prepare(
-      `SELECT updated_at FROM metric_buckets
-       WHERE zone_id = 'zone-rollup' AND bucket_seconds = 3600 AND bucket_start = ?`,
-    ).bind(bucketStart).first<{ updated_at: number }>();
-    expect(first?.updated_at).toBe(scheduledAt);
+      `SELECT bucket_seconds, estimated_count, updated_at FROM metric_buckets
+       WHERE zone_id = 'zone-rollup' ORDER BY bucket_seconds`,
+    ).all<{ bucket_seconds: number; estimated_count: number; updated_at: number }>();
+    expect(first.results).toEqual([{ bucket_seconds: 3600, estimated_count: 12, updated_at: scheduledAt }]);
 
     await runMaintenance(env, scheduledAt + 3_600_000);
     const second = await env.DB.prepare(
-      `SELECT updated_at FROM metric_buckets
-       WHERE zone_id = 'zone-rollup' AND bucket_seconds = 3600 AND bucket_start = ?`,
-    ).bind(bucketStart).first<{ updated_at: number }>();
-    expect(second?.updated_at).toBe(scheduledAt);
+      `SELECT bucket_seconds, estimated_count, updated_at FROM metric_buckets
+       WHERE zone_id = 'zone-rollup'`,
+    ).all<{ bucket_seconds: number; estimated_count: number; updated_at: number }>();
+    expect(second.results).toEqual([{ bucket_seconds: 3600, estimated_count: 12, updated_at: scheduledAt }]);
+  });
+
+  it("小时指标超过长期边界后原子替换为唯一每日副本", async () => {
+    const scheduledAt = Math.floor(Date.now() / 86_400_000) * 86_400_000;
+    const bucketStart = scheduledAt - 731 * 86_400_000;
+    await insertZone("zone-daily-rollup", "daily-rollup.example");
+    await setD1Writes(0);
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO metric_buckets
+         (zone_id, bucket_start, bucket_seconds, metric_kind, dimension_signature,
+          estimated_count, updated_at)
+         VALUES ('zone-daily-rollup', ?, 3600, 'security', '{}', 8, ?)`,
+      ).bind(bucketStart, scheduledAt - 1_000),
+      env.DB.prepare(
+        `INSERT INTO metric_buckets
+         (zone_id, bucket_start, bucket_seconds, metric_kind, dimension_signature,
+          estimated_count, updated_at)
+         VALUES ('zone-daily-rollup', ?, 3600, 'security', '{}', 13, ?)`,
+      ).bind(bucketStart + 3_600_000, scheduledAt - 1_000),
+    ]);
+
+    await runMaintenance(env, scheduledAt);
+
+    const stored = await env.DB.prepare(
+      `SELECT bucket_start, bucket_seconds, estimated_count FROM metric_buckets
+       WHERE zone_id = 'zone-daily-rollup'`,
+    ).all<{ bucket_start: number; bucket_seconds: number; estimated_count: number }>();
+    expect(stored.results).toEqual([{ bucket_start: bucketStart, bucket_seconds: 86400, estimated_count: 21 }]);
   });
 });
 

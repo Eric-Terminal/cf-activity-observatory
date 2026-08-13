@@ -364,15 +364,29 @@ async function queryMetrics(database: D1Database, url: URL): Promise<{ bucketSec
     bindings.push(...zones);
   }
   bindings.push(bucketSeconds);
+  const bucketMilliseconds = bucketSeconds * 1000;
+  const bucketStartSql = `CAST(bucket_start / ${bucketMilliseconds} AS INTEGER) * ${bucketMilliseconds}`;
+  const topDimensionsSql = highCardinality
+    ? `WHERE dimension IN (
+         SELECT dimension FROM bucketed
+         GROUP BY dimension ORDER BY SUM(estimated_count) DESC, dimension ASC LIMIT 100
+       )`
+    : "";
   const result = await database.prepare(
-    `SELECT bucket_start, ${dimensionSql} AS dimension, SUM(estimated_count) AS estimated_count,
-      AVG(sample_interval) AS sample_interval, SUM(confidence_lower) AS confidence_lower,
-      SUM(confidence_upper) AS confidence_upper, SUM(edge_response_bytes) AS edge_response_bytes,
-      SUM(visits) AS visits
-     FROM metric_buckets
-     WHERE metric_kind = ? AND bucket_start >= ? AND bucket_start < ?${dimensionFilter}${zoneFilter}
-       AND bucket_seconds = ?
-     GROUP BY bucket_start, dimension ORDER BY bucket_start ASC, estimated_count DESC`,
+    `WITH bucketed AS (
+       SELECT ${bucketStartSql} AS bucket_start, ${dimensionSql} AS dimension,
+        SUM(estimated_count) AS estimated_count, AVG(sample_interval) AS sample_interval,
+        SUM(confidence_lower) AS confidence_lower, SUM(confidence_upper) AS confidence_upper,
+        SUM(edge_response_bytes) AS edge_response_bytes, SUM(visits) AS visits
+       FROM metric_buckets
+       WHERE metric_kind = ? AND bucket_start >= ? AND bucket_start < ?${dimensionFilter}${zoneFilter}
+         AND bucket_seconds <= ?
+       GROUP BY ${bucketStartSql}, ${dimensionSql}
+     )
+     SELECT bucket_start, dimension, estimated_count, sample_interval, confidence_lower,
+      confidence_upper, edge_response_bytes, visits
+     FROM bucketed ${topDimensionsSql}
+     ORDER BY bucket_start ASC, estimated_count DESC`,
   )
     .bind(...bindings)
     .all<Record<string, unknown>>();

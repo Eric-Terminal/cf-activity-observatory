@@ -431,17 +431,45 @@ function metricStatement(database: D1Database, dataset: DatasetName, zoneId: str
   const bucketStart = parseCloudflareTime(dimensions.datetimeFiveMinutes ?? dimensions.datetimeHour ?? dimensions.date) ?? nowMs();
   const bucketSeconds = dimensions.datetimeFiveMinutes ? 300 : dimensions.datetimeHour ? 3600 : 86400;
   const metricKind = dataset === "httpRequestsAdaptiveGroups" ? "http" : "security";
-  const signature = canonicalJson(dimensions);
-  const id = stableId(zoneId, bucketStart, bucketSeconds, metricKind, signature);
   const estimated = asNumber(row.count ?? confidenceMetric.estimate) ?? 0;
+  const host = asString(dimensions.clientRequestHTTPHost);
+  const country = asString(dimensions.clientCountryName);
+  const asn = asNumber(dimensions.clientAsn);
+  const method = asString(dimensions.clientRequestHTTPMethodName);
+  const protocol = asString(dimensions.clientRequestHTTPProtocol);
+  const edgeStatus = asNumber(dimensions.edgeResponseStatus);
+  const originStatus = asNumber(dimensions.originResponseStatus);
+  const status = statusClass(edgeStatus);
+  const cacheStatus = asString(dimensions.cacheStatus);
+  const securityAction = asString(dimensions.securityAction ?? dimensions.action);
+  const securitySource = asString(dimensions.securitySource ?? dimensions.source);
+  const requestSource = asString(dimensions.requestSource);
   const dimensionType = asString(row.__observatoryDimensionType);
+  const dimensionValue = rankingValue(dimensions, dimensionType);
+  // 时间属于桶的身份，而不是序列维度；排除它后，同一序列才能在老化时正确合并。
+  const signature = canonicalJson({
+    asn,
+    cacheStatus,
+    country,
+    dimensionType,
+    dimensionValue,
+    edgeStatus,
+    host,
+    method,
+    originStatus,
+    protocol,
+    requestSource,
+    securityAction,
+    securitySource,
+    statusClass: status,
+  });
   return database.prepare(
     `INSERT INTO metric_buckets
-     (id, zone_id, bucket_start, bucket_seconds, metric_kind, dimension_signature, host, country, asn,
+     (zone_id, bucket_start, bucket_seconds, metric_kind, dimension_signature, host, country, asn,
       method, protocol, edge_status, origin_status, status_class, cache_status, security_action, security_source, request_source,
       dimension_type, dimension_value, estimated_count, sample_interval, confidence_estimate, confidence_lower,
       confidence_upper, confidence_sample_size, edge_response_bytes, visits, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(zone_id, bucket_start, bucket_seconds, metric_kind, dimension_signature) DO UPDATE SET
       estimated_count = excluded.estimated_count, sample_interval = excluded.sample_interval,
       confidence_estimate = excluded.confidence_estimate, confidence_lower = excluded.confidence_lower,
@@ -456,13 +484,8 @@ function metricStatement(database: D1Database, dataset: DatasetName, zoneId: str
         OR metric_buckets.edge_response_bytes IS NOT excluded.edge_response_bytes
         OR metric_buckets.visits IS NOT excluded.visits`,
   ).bind(
-    id, zoneId, bucketStart, bucketSeconds, metricKind, signature, asString(dimensions.clientRequestHTTPHost),
-    asString(dimensions.clientCountryName), asNumber(dimensions.clientAsn), asString(dimensions.clientRequestHTTPMethodName),
-    asString(dimensions.clientRequestHTTPProtocol), asNumber(dimensions.edgeResponseStatus),
-    asNumber(dimensions.originResponseStatus),
-    statusClass(asNumber(dimensions.edgeResponseStatus)), asString(dimensions.cacheStatus),
-    asString(dimensions.securityAction ?? dimensions.action), asString(dimensions.securitySource ?? dimensions.source),
-    asString(dimensions.requestSource), dimensionType, rankingValue(dimensions, dimensionType),
+    zoneId, bucketStart, bucketSeconds, metricKind, signature, host, country, asn, method, protocol, edgeStatus,
+    originStatus, status, cacheStatus, securityAction, securitySource, requestSource, dimensionType, dimensionValue,
     estimated, asNumber(average.sampleInterval), asNumber(confidenceMetric.estimate), asNumber(confidenceMetric.lower),
     asNumber(confidenceMetric.upper), asNumber(confidenceMetric.sampleSize), asNumber(sum.edgeResponseBytes), asNumber(sum.visits), nowMs(),
   );

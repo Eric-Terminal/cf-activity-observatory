@@ -202,144 +202,65 @@ async function pruneArchivedDetails(env: Env, timestamp: number): Promise<void> 
 }
 
 async function rollupMetrics(database: D1Database, timestamp: number): Promise<void> {
-  const hourCutoff = floorTo(timestamp, HOUR_MS);
-  const dayCutoff = floorTo(timestamp, DAY_MS);
-  const watermark = await database.prepare(
-    "SELECT CAST(value AS INTEGER) AS value FROM app_settings WHERE key = 'metric_rollup_watermark'",
-  ).first<{ value: number }>();
-  const changedSince = watermark?.value ?? timestamp - 2 * HOUR_MS;
-  const metadata: D1Meta[] = [];
-  const hourly = await database.prepare(
-    `WITH changed AS (
-       SELECT DISTINCT zone_id, CAST(bucket_start / 3600000 AS INTEGER) AS hour_key,
-        metric_kind, dimension_signature
-       FROM metric_buckets
-       WHERE bucket_seconds = 300 AND bucket_start < ? AND updated_at > ?
-     )
-     INSERT INTO metric_buckets
-     (id, zone_id, bucket_start, bucket_seconds, metric_kind, dimension_signature, host, country, asn,
-      method, protocol, edge_status, origin_status, status_class, cache_status, security_action, security_source, request_source,
-      dimension_type, dimension_value, estimated_count, sample_interval, confidence_estimate, confidence_lower,
-      confidence_upper, confidence_sample_size, edge_response_bytes, visits, updated_at)
-     SELECT 'h:' || source.zone_id || ':' || changed.hour_key || ':' || source.metric_kind || ':' || source.dimension_signature,
-      source.zone_id, changed.hour_key * 3600000, 3600, source.metric_kind, source.dimension_signature,
-      source.host, source.country, source.asn, source.method, source.protocol, source.edge_status, source.origin_status,
-      source.status_class, source.cache_status, source.security_action, source.security_source, source.request_source,
-      source.dimension_type, source.dimension_value, SUM(source.estimated_count), AVG(source.sample_interval),
-      SUM(source.confidence_estimate), SUM(source.confidence_lower), SUM(source.confidence_upper),
-      SUM(source.confidence_sample_size), SUM(source.edge_response_bytes), SUM(source.visits), ?
-     FROM metric_buckets source JOIN changed
-       ON changed.zone_id = source.zone_id
-      AND changed.hour_key = CAST(source.bucket_start / 3600000 AS INTEGER)
-      AND changed.metric_kind = source.metric_kind
-      AND changed.dimension_signature = source.dimension_signature
-     WHERE source.bucket_seconds = 300
-     GROUP BY source.zone_id, changed.hour_key, source.metric_kind, source.dimension_signature
-     ON CONFLICT(zone_id, bucket_start, bucket_seconds, metric_kind, dimension_signature) DO UPDATE SET
-      estimated_count = excluded.estimated_count, sample_interval = excluded.sample_interval,
-      confidence_estimate = excluded.confidence_estimate, confidence_lower = excluded.confidence_lower,
-      confidence_upper = excluded.confidence_upper, confidence_sample_size = excluded.confidence_sample_size,
-      edge_response_bytes = excluded.edge_response_bytes, visits = excluded.visits, updated_at = excluded.updated_at
-     WHERE metric_buckets.estimated_count IS NOT excluded.estimated_count
-        OR metric_buckets.sample_interval IS NOT excluded.sample_interval
-        OR metric_buckets.confidence_estimate IS NOT excluded.confidence_estimate
-        OR metric_buckets.confidence_lower IS NOT excluded.confidence_lower
-        OR metric_buckets.confidence_upper IS NOT excluded.confidence_upper
-        OR metric_buckets.confidence_sample_size IS NOT excluded.confidence_sample_size
-        OR metric_buckets.edge_response_bytes IS NOT excluded.edge_response_bytes
-        OR metric_buckets.visits IS NOT excluded.visits`,
-  )
-    .bind(hourCutoff, changedSince, timestamp)
-    .run();
-  metadata.push(hourly.meta);
-  const daily = await database.prepare(
-    `WITH changed AS (
-       SELECT DISTINCT zone_id, CAST(bucket_start / 86400000 AS INTEGER) AS day_key,
-        metric_kind, dimension_signature
-       FROM metric_buckets
-       WHERE bucket_seconds = 3600 AND bucket_start < ? AND updated_at > ?
-     )
-     INSERT INTO metric_buckets
-     (id, zone_id, bucket_start, bucket_seconds, metric_kind, dimension_signature, host, country, asn,
-      method, protocol, edge_status, origin_status, status_class, cache_status, security_action, security_source, request_source,
-      dimension_type, dimension_value, estimated_count, sample_interval, confidence_estimate, confidence_lower,
-      confidence_upper, confidence_sample_size, edge_response_bytes, visits, updated_at)
-     SELECT 'd:' || source.zone_id || ':' || changed.day_key || ':' || source.metric_kind || ':' || source.dimension_signature,
-      source.zone_id, changed.day_key * 86400000, 86400, source.metric_kind, source.dimension_signature,
-      source.host, source.country, source.asn, source.method, source.protocol, source.edge_status, source.origin_status,
-      source.status_class, source.cache_status, source.security_action, source.security_source, source.request_source,
-      source.dimension_type, source.dimension_value, SUM(source.estimated_count), AVG(source.sample_interval),
-      SUM(source.confidence_estimate), SUM(source.confidence_lower), SUM(source.confidence_upper),
-      SUM(source.confidence_sample_size), SUM(source.edge_response_bytes), SUM(source.visits), ?
-     FROM metric_buckets source JOIN changed
-       ON changed.zone_id = source.zone_id
-      AND changed.day_key = CAST(source.bucket_start / 86400000 AS INTEGER)
-      AND changed.metric_kind = source.metric_kind
-      AND changed.dimension_signature = source.dimension_signature
-     WHERE source.bucket_seconds = 3600
-     GROUP BY source.zone_id, changed.day_key, source.metric_kind, source.dimension_signature
-     ON CONFLICT(zone_id, bucket_start, bucket_seconds, metric_kind, dimension_signature) DO UPDATE SET
-      estimated_count = excluded.estimated_count, sample_interval = excluded.sample_interval,
-      confidence_estimate = excluded.confidence_estimate, confidence_lower = excluded.confidence_lower,
-      confidence_upper = excluded.confidence_upper, confidence_sample_size = excluded.confidence_sample_size,
-      edge_response_bytes = excluded.edge_response_bytes, visits = excluded.visits, updated_at = excluded.updated_at
-     WHERE metric_buckets.estimated_count IS NOT excluded.estimated_count
-        OR metric_buckets.sample_interval IS NOT excluded.sample_interval
-        OR metric_buckets.confidence_estimate IS NOT excluded.confidence_estimate
-        OR metric_buckets.confidence_lower IS NOT excluded.confidence_lower
-        OR metric_buckets.confidence_upper IS NOT excluded.confidence_upper
-        OR metric_buckets.confidence_sample_size IS NOT excluded.confidence_sample_size
-        OR metric_buckets.edge_response_bytes IS NOT excluded.edge_response_bytes
-        OR metric_buckets.visits IS NOT excluded.visits`,
-  )
-    .bind(dayCutoff, changedSince, timestamp)
-    .run();
-  metadata.push(daily.meta);
-  const oldFiveMinutes = await database.prepare("DELETE FROM metric_buckets WHERE bucket_seconds = 300 AND bucket_start < ?")
-    .bind(timestamp - 90 * DAY_MS)
-    .run();
-  metadata.push(oldFiveMinutes.meta);
-  const oldHourlyRankings = await database.prepare("DELETE FROM metric_buckets WHERE bucket_seconds = 3600 AND bucket_start < ? AND dimension_type IS NOT NULL")
-    .bind(timestamp - 90 * DAY_MS)
-    .run();
-  metadata.push(oldHourlyRankings.meta);
-  const oldHours = await database.prepare("DELETE FROM metric_buckets WHERE bucket_seconds = 3600 AND bucket_start < ?")
-    .bind(timestamp - 730 * DAY_MS)
-    .run();
-  metadata.push(oldHours.meta);
-  metadata.push((await trimHighCardinality(database, 3600, 100)).meta);
-  metadata.push((await trimHighCardinality(database, 86400, 100)).meta);
-  const oldRankings = await database.prepare(
-    `DELETE FROM metric_buckets WHERE bucket_seconds = 300 AND dimension_type IS NOT NULL AND bucket_start < ?`,
-  )
-    .bind(hourCutoff)
-    .run();
-  metadata.push(oldRankings.meta);
-  await recordD1Usage(database, metadata);
-  await database.prepare(
-    `INSERT INTO app_settings (key, value, updated_at) VALUES ('metric_rollup_watermark', ?, ?)
-     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
-  )
-    .bind(String(timestamp), timestamp)
-    .run();
+  await compactMetricTier(database, timestamp, 300, 3600, 90);
+  await compactMetricTier(database, timestamp, 3600, 86400, 730);
 }
 
-async function trimHighCardinality(database: D1Database, bucketSeconds: number, defaultLimit: number) {
-  return database.prepare(
-    `DELETE FROM metric_buckets WHERE id IN (
-       SELECT id FROM (
-         SELECT id, dimension_type,
-          ROW_NUMBER() OVER (
-            PARTITION BY zone_id, bucket_start, metric_kind, dimension_type
-            ORDER BY estimated_count DESC, dimension_value ASC
-          ) AS rank
-         FROM metric_buckets WHERE bucket_seconds = ? AND dimension_type IS NOT NULL
-       ) ranked
-       WHERE rank > CASE WHEN dimension_type = 'userAgent' THEN 50 ELSE ? END
-     )`,
+async function compactMetricTier(
+  database: D1Database,
+  timestamp: number,
+  sourceSeconds: 300 | 3600,
+  targetSeconds: 3600 | 86400,
+  minimumAgeDays: number,
+): Promise<void> {
+  const targetMs = targetSeconds * 1000;
+  const cutoff = floorTo(timestamp - minimumAgeDays * DAY_MS, targetMs);
+  const noFinerData = sourceSeconds === 3600
+    ? `AND NOT EXISTS (
+        SELECT 1 FROM metric_buckets finer
+        WHERE finer.bucket_seconds = 300
+          AND finer.bucket_start >= CAST(source.bucket_start / 86400000 AS INTEGER) * 86400000
+          AND finer.bucket_start < (CAST(source.bucket_start / 86400000 AS INTEGER) + 1) * 86400000
+      )`
+    : "";
+  const oldest = await database.prepare(
+    `SELECT MIN(source.bucket_start) AS bucket_start
+     FROM metric_buckets source
+     WHERE source.bucket_seconds = ? AND source.bucket_start < ? ${noFinerData}`,
   )
-    .bind(bucketSeconds, defaultLimit)
-    .run();
+    .bind(sourceSeconds, cutoff)
+    .first<{ bucket_start: number | null }>();
+  if (oldest?.bucket_start === null || oldest?.bucket_start === undefined) return;
+
+  const targetStart = floorTo(oldest.bucket_start, targetMs);
+  const targetEnd = targetStart + targetMs;
+  // 插入与删除同处一个 D1 batch，老化过程中不会出现双份数据，也不会因中途失败丢失源桶。
+  const results = await database.batch([
+    database.prepare(
+      `INSERT INTO metric_buckets
+       (zone_id, bucket_start, bucket_seconds, metric_kind, dimension_signature, host, country, asn,
+        method, protocol, edge_status, origin_status, status_class, cache_status, security_action, security_source,
+        request_source, dimension_type, dimension_value, estimated_count, sample_interval, confidence_estimate,
+        confidence_lower, confidence_upper, confidence_sample_size, edge_response_bytes, visits, updated_at)
+       SELECT zone_id, ?, ?, metric_kind, dimension_signature, host, country, asn,
+        method, protocol, edge_status, origin_status, status_class, cache_status, security_action, security_source,
+        request_source, dimension_type, dimension_value, SUM(estimated_count), AVG(sample_interval),
+        SUM(confidence_estimate), SUM(confidence_lower), SUM(confidence_upper), SUM(confidence_sample_size),
+        SUM(edge_response_bytes), SUM(visits), ?
+       FROM metric_buckets
+       WHERE bucket_seconds = ? AND bucket_start >= ? AND bucket_start < ?
+       GROUP BY zone_id, metric_kind, dimension_signature
+       ON CONFLICT(zone_id, bucket_start, bucket_seconds, metric_kind, dimension_signature) DO UPDATE SET
+        estimated_count = excluded.estimated_count, sample_interval = excluded.sample_interval,
+        confidence_estimate = excluded.confidence_estimate, confidence_lower = excluded.confidence_lower,
+        confidence_upper = excluded.confidence_upper, confidence_sample_size = excluded.confidence_sample_size,
+        edge_response_bytes = excluded.edge_response_bytes, visits = excluded.visits, updated_at = excluded.updated_at`,
+    ).bind(targetStart, targetSeconds, timestamp, sourceSeconds, targetStart, targetEnd),
+    database.prepare(
+      "DELETE FROM metric_buckets WHERE bucket_seconds = ? AND bucket_start >= ? AND bucket_start < ?",
+    ).bind(sourceSeconds, targetStart, targetEnd),
+  ]);
+  await recordD1Usage(database, results.map((result) => result.meta));
 }
 
 async function gzip(input: Uint8Array): Promise<Uint8Array> {
