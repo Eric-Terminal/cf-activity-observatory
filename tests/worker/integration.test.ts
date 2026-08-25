@@ -13,6 +13,7 @@ import { csvCell, estimateDailyQueueOperations } from "@/worker/api";
 import { dotStuff, mimeMessage } from "@/worker/smtp";
 import { CloudflareApiError } from "@/worker/cloudflare";
 import { alertNeedsNotification, evaluateAlerts } from "@/worker/alerts";
+import { D1_DAILY_WRITE_PAUSE } from "@/worker/budgets";
 import worker from "@/worker/index";
 
 afterEach(() => {
@@ -295,10 +296,14 @@ describe("Worker API 与存储", () => {
     expect(await env.ARCHIVES.head(manifest?.r2_key ?? "missing")).not.toBeNull();
   });
 
+  it("D1 总写入预算为账户保留 30% 安全余量", () => {
+    expect(D1_DAILY_WRITE_PAUSE).toBe(70_000);
+  });
+
   it("D1 写入预算暂停时不再调度采集任务", async () => {
     const scheduledAt = Date.UTC(2026, 7, 12, 10, 20);
     await insertZone("zone-budget-dispatch", "budget-dispatch.example");
-    await setD1Writes(80_000);
+    await setD1Writes(D1_DAILY_WRITE_PAUSE);
     const fetchMock = vi.fn(() => Promise.reject(new Error("预算暂停时不应请求 Cloudflare")));
     vi.stubGlobal("fetch", fetchMock);
 
@@ -323,7 +328,7 @@ describe("Worker API 与存储", () => {
        (zone_id, dataset, cursor_at, last_success_at, consecutive_failures, in_flight_until, last_error, updated_at)
        VALUES ('zone-budget-consumer', 'httpRequestsAdaptive', ?, ?, 2, ?, '此前的真实错误', ?)`,
     ).bind(timestamp - 60_000, timestamp - 120_000, timestamp + 15 * 60_000, timestamp).run();
-    await setD1Writes(80_000, timestamp);
+    await setD1Writes(D1_DAILY_WRITE_PAUSE, timestamp);
     const fetchMock = vi.fn(() => Promise.reject(new Error("预算暂停时不应请求 Cloudflare")));
     vi.stubGlobal("fetch", fetchMock);
     const send = vi.spyOn(env.COLLECTOR_QUEUE, "send");
@@ -363,7 +368,7 @@ describe("Worker API 与存储", () => {
       `INSERT INTO sync_cursors (zone_id, dataset, cursor_at, consecutive_failures, in_flight_until, updated_at)
        VALUES ('zone-budget-queue', 'httpRequestsAdaptive', ?, 0, ?, ?)`,
     ).bind(timestamp - 60_000, timestamp + 15 * 60_000, timestamp).run();
-    await setD1Writes(80_000, timestamp);
+    await setD1Writes(D1_DAILY_WRITE_PAUSE, timestamp);
 
     const batch = createMessageBatch("cf-activity-observatory", [{
       id: "budget-queue-message",
@@ -587,7 +592,7 @@ describe("Worker API 与存储", () => {
       `INSERT INTO alert_state (alert_key, status, first_seen_at, last_seen_at, details)
        VALUES ('collector:zone-budget-alert:httpRequestsAdaptive', 'active', ?, ?, '{}')`,
     ).bind(timestamp - 60_000, timestamp - 60_000).run();
-    await setD1Writes(80_000, timestamp);
+    await setD1Writes(D1_DAILY_WRITE_PAUSE, timestamp);
 
     await evaluateAlerts(env);
 

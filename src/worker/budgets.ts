@@ -1,6 +1,7 @@
 import { nowMs } from "@/worker/utils";
 
-export const D1_DAILY_WRITE_PAUSE = 80_000;
+// 应用计数不覆盖所有控制语句、索引写入和同账户数据库，预留 30% 避免免费额度被打满。
+export const D1_DAILY_WRITE_PAUSE = 70_000;
 export const D1_DAILY_BACKFILL_PAUSE = 20_000;
 
 export async function d1WritesPaused(database: D1Database): Promise<boolean> {

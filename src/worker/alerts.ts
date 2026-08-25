@@ -57,7 +57,10 @@ export async function evaluateAlerts(env: Env): Promise<void> {
     }
   }
   if (collectionPaused) {
-    active.set("budget:d1-writes", { title: "D1 写入额度达到 80%", details: "采集已停止推进游标，UTC 零点后自动恢复。" });
+    active.set("budget:d1-writes", {
+      title: "D1 写入达到安全水位",
+      details: `应用内计数已达到 ${D1_DAILY_WRITE_PAUSE.toLocaleString("zh-CN")} 行；采集已停止推进游标，为漏记写入和同账户数据库预留额度，UTC 零点后自动恢复。`,
+    });
   }
   if (Number(usage?.d1_size_after ?? 0) >= Number(env.D1_WARNING_BYTES)) {
     active.set("storage:d1", { title: "D1 存储达到安全水位", details: "系统将优先归档并清理最旧的完整小时。" });

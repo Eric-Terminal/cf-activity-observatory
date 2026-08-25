@@ -27,7 +27,7 @@ Detail rows represent real requests, but not every request. Trend charts use Gro
 - Adjusted request/mitigation trends, action distribution, country map, and separate high-cardinality cubes for path, IP, ASN, User-Agent, and rules.
 - D1 online detail retention (90 days by default) and verified hourly gzip NDJSON archives in R2.
 - Five-minute, hourly, and daily trend retention with a 400 MB D1 safety waterline.
-- Free-tier guards: 240 GraphQL calls per five minutes, 20% Queue reserve, and D1 write pause at 80% of the daily budget.
+- Free-tier guards: 240 GraphQL calls per five minutes, 20% Queue reserve, and collection pause when the application-counted D1 writes reach 70% of the daily budget.
 - Cloudflare Access JWT verification, same-origin protection for writes, and strict security headers.
 - SMTP alerts over implicit TLS on 465 or STARTTLS on 587, with AES-GCM encrypted passwords.
 - Simplified Chinese and English, light/dark/system themes, responsive layout, and reduced-motion support.
@@ -111,6 +111,8 @@ Add a custom domain, then create a Cloudflare Access Self-hosted application for
 ## Free-tier estimate
 
 One zone, four datasets, and a five-minute polling interval is estimated at about 3,456 Queue operations per day including send/receive/ack accounting. The UI estimates all enabled zones and rejects configurations above the 8,000/day safety budget, leaving room for repair, retries, archives, and other account activity.
+
+Historical backfill pauses at 20,000 application-counted D1 rows while live collection may continue. All collection pauses at 70,000 application-counted rows and resumes after the next UTC reset. The remaining 30% of the account-level allowance covers control and index writes not reflected in the application counter, queued work, and other databases in the same account.
 
 Cloudflare limits can change; verify current limits before deployment. The application's counters estimate only its own usage, not other workloads in the account.
 
