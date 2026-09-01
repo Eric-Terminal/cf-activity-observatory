@@ -6,6 +6,7 @@ import {
   getDatasetCapabilities,
   type DatasetResult,
 } from "@/worker/cloudflare";
+import { archiveDetailRows } from "@/worker/archive";
 import { getCapability, incrementUsage, recordD1Usage } from "@/worker/db";
 import {
   D1_DAILY_BACKFILL_PAUSE,
@@ -323,7 +324,7 @@ async function collectWindow(
       )
       .run();
   }
-  stats.inserted += await persistRows(env.DB, capability.dataset, capability.zoneId, result, job.id);
+  stats.inserted += await persistRows(env, capability.dataset, capability.zoneId, result);
   if (!result.saturated) {
     // 完整查询覆盖缺口后才关闭它；更大的小时修复窗口也能修复先前切分出的叶子区间。
     await env.DB.prepare(
@@ -338,88 +339,22 @@ async function collectWindow(
 }
 
 async function persistRows(
-  database: D1Database,
+  env: Env,
   dataset: DatasetName,
   zoneId: string,
   result: DatasetResult,
-  batchId: string,
 ): Promise<number> {
-  const statements = result.rows.flatMap((row) => {
-    if (dataset === "httpRequestsAdaptive") return [requestStatement(database, zoneId, row, batchId)];
-    if (dataset === "firewallEventsAdaptive") return [eventStatement(database, zoneId, row, batchId)];
-    return [metricStatement(database, dataset, zoneId, row)];
-  });
+  if (dataset === "httpRequestsAdaptive" || dataset === "firewallEventsAdaptive") {
+    return archiveDetailRows(env, dataset, zoneId, result.rows);
+  }
+  const statements = result.rows.map((row) => metricStatement(env.DB, dataset, zoneId, row));
   let changes = 0;
   for (let index = 0; index < statements.length; index += 80) {
-    const batch = await database.batch(statements.slice(index, index + 80));
+    const batch = await env.DB.batch(statements.slice(index, index + 80));
     changes += batch.reduce((sum, item) => sum + item.meta.changes, 0);
-    await recordD1Usage(database, batch.map((item) => item.meta));
+    await recordD1Usage(env.DB, batch.map((item) => item.meta));
   }
   return changes;
-}
-
-function requestStatement(database: D1Database, zoneId: string, row: Record<string, unknown>, batchId: string): D1PreparedStatement {
-  const occurredAt = parseCloudflareTime(row.datetime) ?? nowMs();
-  const rayId = asString(row.rayName);
-  // ASN 字段曾因大小写错误而未被查询；排除它可保持旧记录 ID 稳定，让修复后的回采原位补齐号码。
-  const identityRow = Object.fromEntries(Object.entries(row).filter(([key]) => key !== "clientAsn"));
-  const id = stableId(zoneId, occurredAt, rayId, canonicalJson(identityRow));
-  const known = new Set([
-    "datetime", "rayName", "clientIP", "clientCountryName", "clientAsn", "clientASNDescription", "userAgent",
-    "clientRefererHost", "clientDeviceType", "clientRequestHTTPHost", "clientRequestPath", "clientRequestQuery",
-    "clientRequestHTTPMethodName", "clientRequestHTTPProtocol", "requestSource", "coloCode", "cacheStatus",
-    "originResponseStatus", "edgeResponseStatus", "securityAction", "securitySource", "securityRuleID",
-    "botManagementScore", "botManagementScoreSrc", "botManagementScoreSrcName", "botManagementTags",
-    "botManagementVerifiedBot", "verifiedBotCategory", "wafAttackScore", "contentScanObjResults",
-    "leakedCredentialCheckResult", "sampleInterval",
-  ]);
-  return database.prepare(
-    `INSERT INTO request_samples
-     (id, zone_id, occurred_at, ray_id, client_ip, country, asn, asn_description, user_agent, referer,
-      device_type, host, path, query, method, protocol, request_source, colo, cache_status, origin_status,
-      edge_status, security_action, security_source, security_rule_id, bot_score, bot_score_source, bot_tags,
-      verified_bot_category, attack_score, content_scan_result, leaked_credential_result, sample_interval,
-      collected_at, batch_id, extra)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(id) DO UPDATE SET asn = excluded.asn
-     WHERE request_samples.asn IS NULL AND excluded.asn IS NOT NULL`,
-  ).bind(
-    id, zoneId, occurredAt, rayId, asString(row.clientIP), asString(row.clientCountryName), asNumber(row.clientAsn),
-    asString(row.clientASNDescription), asString(row.userAgent), asString(row.clientRefererHost), asString(row.clientDeviceType),
-    asString(row.clientRequestHTTPHost), asString(row.clientRequestPath), asString(row.clientRequestQuery),
-    asString(row.clientRequestHTTPMethodName), asString(row.clientRequestHTTPProtocol), asString(row.requestSource),
-    asString(row.coloCode), asString(row.cacheStatus), asNumber(row.originResponseStatus), asNumber(row.edgeResponseStatus),
-    asString(row.securityAction), asString(row.securitySource), asString(row.securityRuleID), asNumber(row.botManagementScore),
-    asString(row.botManagementScoreSrc ?? row.botManagementScoreSrcName), JSON.stringify(row.botManagementTags ?? []),
-    row.botManagementVerifiedBot === true ? "verified" : asString(row.verifiedBotCategory), asNumber(row.wafAttackScore),
-    JSON.stringify(row.contentScanObjResults ?? null), asString(row.leakedCredentialCheckResult), asNumber(row.sampleInterval),
-    nowMs(), batchId, JSON.stringify(remaining(row, known)),
-  );
-}
-
-function eventStatement(database: D1Database, zoneId: string, row: Record<string, unknown>, batchId: string): D1PreparedStatement {
-  const occurredAt = parseCloudflareTime(row.datetime) ?? nowMs();
-  const rayId = asString(row.rayName);
-  const id = stableId(zoneId, occurredAt, rayId, asString(row.source), asString(row.ruleId), asString(row.action));
-  const known = new Set([
-    "datetime", "rayName", "action", "source", "ruleId", "description", "rulesetId", "kind", "clientIP",
-    "clientCountryName", "clientAsn", "clientRequestHTTPHost", "clientRequestPath", "clientRequestQuery",
-    "clientRequestHTTPMethodName", "userAgent", "sampleInterval",
-  ]);
-  return database.prepare(
-    `INSERT INTO security_events
-     (id, zone_id, occurred_at, ray_id, action, source, rule_id, rule_description, ruleset_id, kind,
-      client_ip, country, asn, host, path, query, method, user_agent, sample_interval, collected_at, batch_id, extra)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(id) DO UPDATE SET asn = excluded.asn
-     WHERE security_events.asn IS NULL AND excluded.asn IS NOT NULL`,
-  ).bind(
-    id, zoneId, occurredAt, rayId, asString(row.action), asString(row.source), asString(row.ruleId),
-    asString(row.description), asString(row.rulesetId), asString(row.kind), asString(row.clientIP),
-    asString(row.clientCountryName), asNumber(row.clientAsn), asString(row.clientRequestHTTPHost),
-    asString(row.clientRequestPath), asString(row.clientRequestQuery), asString(row.clientRequestHTTPMethodName),
-    asString(row.userAgent), asNumber(row.sampleInterval), nowMs(), batchId, JSON.stringify(remaining(row, known)),
-  );
 }
 
 function metricStatement(database: D1Database, dataset: DatasetName, zoneId: string, row: Record<string, unknown>): D1PreparedStatement {
@@ -499,10 +434,6 @@ function rankingValue(dimensions: Record<string, unknown>, type: string | null):
 
 function statusClass(status: number | null): number | null {
   return status === null ? null : Math.floor(status / 100);
-}
-
-function remaining(row: Record<string, unknown>, known: Set<string>): Record<string, unknown> {
-  return Object.fromEntries(Object.entries(row).filter(([key]) => !known.has(key)));
 }
 
 async function reserveGraphqlBudget(database: D1Database, amount: number): Promise<boolean> {

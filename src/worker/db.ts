@@ -2,6 +2,7 @@ import type {
   CollectorHealth,
   DatasetCapability,
   DatasetName,
+  DetailFilter,
   PaginatedResult,
   SampledRequest,
   SecurityEvent,
@@ -202,32 +203,8 @@ export async function incrementUsage(
     .run();
 }
 
-interface ListFilterInput {
-  zoneIds: string[];
-  from: number;
-  to: number;
-  limit: number;
-  cursor?: string;
-  clientIp?: string;
-  country?: string;
-  asn?: number;
-  host?: string;
-  path?: string;
-  query?: string;
-  method?: string;
-  protocol?: string;
-  status?: number;
-  cacheStatus?: string;
-  securityAction?: string;
-  securitySource?: string;
-  rayId?: string;
-  userAgent?: string;
-  requestSource?: string;
-  ruleId?: string;
-}
-
 function buildWhere(
-  input: ListFilterInput,
+  input: DetailFilter,
   columns: {
     action: string;
     source: string;
@@ -296,7 +273,7 @@ function escapeLike(value: string): string {
   return value.replaceAll("\\", "\\\\").replaceAll("%", "\\%").replaceAll("_", "\\_");
 }
 
-export async function listRequests(database: D1Database, input: ListFilterInput): Promise<PaginatedResult<SampledRequest>> {
+export async function listRequests(database: D1Database, input: DetailFilter): Promise<PaginatedResult<SampledRequest>> {
   const where = buildWhere(input, {
     action: "security_action",
     source: "security_source",
@@ -327,7 +304,7 @@ export async function getRequest(database: D1Database, id: string): Promise<Samp
 
 export async function listSecurityEvents(
   database: D1Database,
-  input: ListFilterInput,
+  input: DetailFilter,
 ): Promise<PaginatedResult<SecurityEvent>> {
   const where = buildWhere(input, { action: "action", source: "source", ruleId: "rule_id" });
   const result = await database
@@ -598,7 +575,7 @@ function mergeAdjacentGaps(gaps: CollectorHealth["gaps"]): CollectorHealth["gaps
   return merged;
 }
 
-export function filtersFromUrl(url: URL): ListFilterInput {
+export function filtersFromUrl(url: URL): DetailFilter {
   const from = Date.parse(url.searchParams.get("from") ?? new Date(nowMs() - 86_400_000).toISOString());
   const to = Date.parse(url.searchParams.get("to") ?? new Date().toISOString());
   if (!Number.isFinite(from) || !Number.isFinite(to) || from >= to) throw new Error("时间范围无效");

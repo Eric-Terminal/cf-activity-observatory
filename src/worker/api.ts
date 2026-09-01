@@ -1,5 +1,4 @@
 import { Hono } from "hono";
-import { z } from "zod";
 import type { AccessIdentity, SavedViewInput } from "@/shared/contracts";
 import { savedViewSchema, smtpConfigSchema, zoneConfigSchema } from "@/shared/contracts";
 import { getArchive, listArchives } from "@/worker/archive";
@@ -19,7 +18,7 @@ import {
 } from "@/worker/db";
 import { loadSmtp } from "@/worker/alerts";
 import { sendSmtp } from "@/worker/smtp";
-import { asRecord, jsonError, nowMs, parseCsv, parseTimeRange, sanitizeError } from "@/worker/utils";
+import { jsonError, nowMs, parseCsv, parseTimeRange, sanitizeError } from "@/worker/utils";
 
 type Variables = { identity: AccessIdentity };
 const api = new Hono<{ Bindings: Env; Variables: Variables }>().basePath("/api/v1");
@@ -139,7 +138,30 @@ api.get("/metrics", async (context) => {
   }
 });
 
-api.get("/archives", async (context) => context.json({ items: await listArchives(context.env.DB) }));
+api.get("/archives", async (context) => {
+  try {
+    const url = new URL(context.req.url);
+    const requestedDataset = url.searchParams.get("dataset");
+    const dataset = requestedDataset === "httpRequestsAdaptive" || requestedDataset === "firewallEventsAdaptive"
+      ? requestedDataset
+      : undefined;
+    if (requestedDataset && !dataset) throw new Error("不支持的归档数据集");
+    const hasRange = url.searchParams.has("from") || url.searchParams.has("to");
+    const range = hasRange
+      ? parseTimeRange(url.searchParams.get("from") ?? undefined, url.searchParams.get("to") ?? undefined)
+      : {};
+    return context.json({
+      items: await listArchives(context.env.DB, {
+        dataset,
+        ...range,
+        zoneIds: parseCsv(url.searchParams.get("zones") ?? undefined),
+        limit: Number(url.searchParams.get("limit") ?? (hasRange ? 5_000 : 200)),
+      }),
+    });
+  } catch (error) {
+    return jsonError(context, 422, "INVALID_ARCHIVE_FILTER", sanitizeError(error));
+  }
+});
 
 api.get("/archives/:id/download", async (context) => {
   const manifest = await getArchive(context.env.DB, context.req.param("id"));
@@ -148,8 +170,8 @@ api.get("/archives/:id/download", async (context) => {
   if (!object) return jsonError(context, 404, "ARCHIVE_OBJECT_MISSING", "R2 对象不存在");
   return new Response(object.body, {
     headers: {
-      "Content-Type": "application/x-ndjson",
-      "Content-Encoding": "gzip",
+      // 不声明 Content-Encoding，浏览器才能拿到原始 gzip 字节并在本地显式流式解压。
+      "Content-Type": "application/gzip",
       "Content-Disposition": `attachment; filename="${manifest.dataset}-${manifest.range_start}.ndjson.gz"`,
       "Cache-Control": "private, no-store",
     },
@@ -304,19 +326,12 @@ api.get("/health", async (context) => {
   }
 });
 
-api.get("/export", async (context) => {
-  const url = new URL(context.req.url);
-  const type = url.searchParams.get("type") === "security" ? "security" : "requests";
-  const format = z.enum(["csv", "json", "ndjson"]).catch("csv").parse(url.searchParams.get("format"));
-  const filters = filtersFromUrl(url);
-  filters.limit = Math.min(filters.limit, 500);
-  const result = type === "security"
-    ? await listSecurityEvents(context.env.DB, filters)
-    : await listRequests(context.env.DB, filters);
-  if (format === "json") return new Response(JSON.stringify(result.items, null, 2), { headers: exportHeaders("application/json", `${type}.json`) });
-  if (format === "ndjson") return new Response(`${result.items.map((item) => JSON.stringify(item)).join("\n")}\n`, { headers: exportHeaders("application/x-ndjson", `${type}.ndjson`) });
-  return new Response(toCsv(result.items), { headers: exportHeaders("text/csv; charset=utf-8", `${type}.csv`) });
-});
+api.get("/export", (context) => jsonError(
+  context,
+  409,
+  "BROWSER_EXPORT_REQUIRED",
+  "明细已迁移到 R2 冷归档，请在归档页面由浏览器本地生成导出文件",
+));
 
 api.notFound((context) => jsonError(context, 404, "API_NOT_FOUND", "API 路径不存在"));
 api.onError((error, context) => {
@@ -413,24 +428,4 @@ export function estimateDailyQueueOperations(zones: Array<{ enabled: boolean; po
   return Math.ceil(
     zones.filter((zone) => zone.enabled).reduce((total, zone) => total + (1440 / zone.pollIntervalMinutes) * 4 * 3 + 4 * 24 * 3, 0),
   );
-}
-
-export function csvCell(value: unknown): string {
-  let text = typeof value === "object" && value !== null
-    ? JSON.stringify(value)
-    : typeof value === "string" || typeof value === "number" || typeof value === "boolean" || typeof value === "bigint"
-      ? String(value)
-      : "";
-  if (/^[=+\-@]/u.test(text)) text = `'${text}`;
-  return `"${text.replaceAll('"', '""')}"`;
-}
-
-function toCsv(items: unknown[]): string {
-  const records = items.map(asRecord);
-  const fields = [...new Set(records.flatMap((record) => Object.keys(record)))];
-  return `\uFEFF${fields.map(csvCell).join(",")}\r\n${records.map((record) => fields.map((field) => csvCell(record[field])).join(",")).join("\r\n")}\r\n`;
-}
-
-function exportHeaders(contentType: string, filename: string): HeadersInit {
-  return { "Content-Type": contentType, "Content-Disposition": `attachment; filename="${filename}"`, "Cache-Control": "private, no-store" };
 }

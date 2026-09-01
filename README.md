@@ -2,7 +2,7 @@
 
 [English](./README_EN.md) · [归档格式](./docs/ARCHIVE_SCHEMA.md) · [安全策略](./SECURITY.md)
 
-CF Activity Observatory 是一个部署在 Cloudflare Workers 上的自托管 HTTP 活动与安全分析工具。它定期读取 Cloudflare GraphQL Analytics API，将短期可见的采样明细、采样校正趋势保存到 D1 与 R2，并提供可按几天、几周或几个月查看的 WebUI。
+CF Activity Observatory 是一个部署在 Cloudflare Workers 上的自托管 HTTP 活动与安全分析工具。它定期读取 Cloudflare GraphQL Analytics API，将采样明细直接保存到 R2，把采样校正趋势与运行状态保存到 D1，并提供可按几天、几周或几个月查看的 WebUI。
 
 > 本项目与 Cloudflare, Inc. 没有官方关联。Cloudflare 是其各自所有者的商标。
 
@@ -23,9 +23,10 @@ CF Activity Observatory 是一个部署在 Cloudflare Workers 上的自托管 HT
 - 首次按 `notOlderThan` 自动补采；持久化游标支持中断续跑。
 - 只查询到当前时间前 5 分钟，每小时重查最近一小时以修复迟到数据。
 - 饱和页面拆成独立 Queue 续传任务；子窗口完成前保留可见的数据缺口，避免单次 Worker 超出子请求限制。
-- HTTP 与安全采样明细的组合筛选、URL 恢复、保存视图与键集分页。
+- HTTP 与安全采样明细直接写入每小时 R2 冷归档；网页按所选范围下载并在浏览器本地解压、筛选和键集分页。
+- 请求探索器支持组合筛选、URL 恢复和保存视图；归档页可在浏览器本地生成 CSV、JSON、NDJSON。
 - 校正请求/缓解趋势、动作分布、国家地图，以及 path、IP、ASN、User-Agent、规则的独立高基数 cube。
-- D1 在线明细默认保留 90 天；每小时导出 gzip NDJSON 到 R2，校验完成后才允许清理在线行。
+- schema v2 归档使用 API 同形的 camelCase 记录；网页仍兼容历史 schema v1 D1 原始行，不需要迁移已有 R2 对象。
 - 趋势数据只保留一层：90 天内为 5 分钟，之后原子替换为小时，730 天后再替换为每日；API 按页面所需粒度即时汇总，不在 D1 重复保存同一份趋势。
 - Workers Free 额度预算：GraphQL 240 次/5 分钟软上限、Queue 20% 安全余量、历史回填最多使用 D1 每日写入额度的 20%，应用内 D1 写入计数达到每日额度的 70% 时暂停并在 UTC 零点续传。
 - Cloudflare Access JWT 验证、状态修改同源保护、严格安全响应头。
@@ -39,12 +40,14 @@ flowchart LR
   Cron[每分钟 Cron] --> Queue[Cloudflare Queue]
   Queue --> Collector[采集 Worker]
   Collector --> GQL[GraphQL Analytics API]
-  Collector --> D1[(D1 在线明细/趋势/游标)]
-  Queue --> Maintenance[归档与保留任务]
-  Maintenance --> R2[(R2 小时归档)]
+  Collector --> D1[(D1 趋势/游标/清单)]
+  Collector --> R2[(R2 小时明细归档)]
+  Queue --> Maintenance[趋势老化与告警任务]
   Browser[Access 保护的 WebUI] --> API[Hono /api/v1]
   API --> D1
   API --> R2
+  API --> Browser
+  Browser --> Local[本地解压/筛选/导出]
   Maintenance --> SMTP[加密 SMTP 告警]
 ```
 
@@ -141,16 +144,16 @@ Worker 会按照 Cloudflare 的 [Access JWT 验证方式](https://developers.clo
 
 1. 登录 WebUI，打开“设置与健康”。
 2. 点击“发现 Cloudflare Zone”。
-3. 启用需要的 Zone，设置轮询间隔与在线保留天数。
+3. 启用需要的 Zone 并设置轮询间隔。
 4. 检查四个数据集的动态能力；不可用字段会显示“当前套餐或 API 不提供”。
 5. 可选配置 SMTP；保存后再发送测试邮件。
-6. 等待两个实时轮询周期，确认游标、趋势、采样明细与 R2 归档出现。
+6. 等待两个实时轮询周期，确认游标、趋势与 R2 采样明细归档出现，并在请求探索器打开它们。
 
 ## 免费额度估算
 
-默认按 Workers Free 的常见额度设计。单 Zone、四个数据集、5 分钟频率的基础 Queue 发送/接收/确认估算约 3456 次/日，另外预留修复、重试、归档和用户其他调用。设置页计算所有 Zone 的预计消耗；超过 8000 次/日会拒绝保存。
+默认按 Workers Free 的常见额度设计。单 Zone、四个数据集、5 分钟频率的基础 Queue 发送/接收/确认估算约 3744 次/日，另外预留修复、重试和用户其他调用。设置页计算所有 Zone 的预计消耗；超过 8000 次/日会拒绝保存。
 
-历史回填与实时采集使用不同写入水位：回填达到 20,000 行后延迟到下一个 UTC 日，实时任务可继续使用剩余额度；应用内总写入计数达到 70,000 行时记录暂停区间，并在额度重置后自动拆分补采。30% 的账户级余量用于覆盖应用未回计的控制语句与索引写入、已经入队的任务以及同账户其他数据库。D1 计费会把索引更新计为额外写入，因此明细只保留时间范围查询所需的索引，趋势表使用复合主键和一棵查询索引，并且不会同时写入 5 分钟、小时、每日三份副本。
+采样明细不再写入 D1；D1 仅保存趋势桶、游标、清单、用量与设置。历史回填达到应用内 20,000 行写入计数后延迟到下一个 UTC 日，应用内总写入计数达到 70,000 行时暂停采集并在额度重置后补采。30% 的账户级余量用于覆盖应用未回计的控制语句与索引写入、已入队任务及同账户其他数据库。趋势表使用复合主键和一棵查询索引，并且不会同时保存 5 分钟、小时、每日三份副本。
 
 Cloudflare 产品额度可能调整，以部署时的官方套餐页为准。程序记录自身产生的 GraphQL、Queue、D1 和 R2 估算，不代表账号中其他应用的用量。
 
@@ -162,7 +165,7 @@ R2 key：
 archives/{zone_id}/{dataset}/YYYY/MM/DD/HH.ndjson.gz
 ```
 
-对象第一行是 schema 元数据，后续每行是一条 D1 导出记录。详细格式、校验与恢复方式见 [docs/ARCHIVE_SCHEMA.md](./docs/ARCHIVE_SCHEMA.md)。
+对象第一行是 schema 元数据，后续每行是一条去重的采样明细。网页通过受 Access 保护的 API 流式读取私有对象并在浏览器本地分析；也可以下载原始 gzip 文件。详细格式与兼容规则见 [docs/ARCHIVE_SCHEMA.md](./docs/ARCHIVE_SCHEMA.md)。
 
 升级前备份 D1/R2，拉取新版本，执行远端 migration，再部署：
 
@@ -178,7 +181,7 @@ Worker 代码可通过重新部署上一 Git tag 回滚；包含破坏性数据�
 ## 安全与隐私
 
 - 不采集请求体、Cookie、Authorization 等请求头。
-- 会保存 IP、完整 query、User-Agent 等调查字段；请按所在地法律设置保留期和访问权限。
+- 会保存 IP、完整 query、User-Agent 等调查字段；请按所在地法律配置 R2 生命周期和访问权限。
 - 敏感请求字段不会进入结构化日志、错误摘要或 SMTP 正文。
 - SMTP 密码由 32 字节 `CONFIG_ENCRYPTION_KEY` 使用 AES-GCM 加密；丢失密钥后只能重新填写密码。
 - 应用 Cron 完全停止时无法自我发送故障邮件。建议用外部监控检查 `/api/v1/health`，外部监控同样应通过 Access Service Token。
@@ -188,12 +191,11 @@ Worker 代码可通过重新部署上一 Git tag 回滚；包含破坏性数据�
 
 所有接口位于 `/api/v1`，返回 `Cache-Control: no-store`。主要端点：
 
-- `GET /me`, `/zones`, `/metrics`, `/requests`, `/security-events`, `/archives`, `/health`
+- `GET /me`, `/zones`, `/metrics`, `/archives`, `/archives/:id/download`, `/health`
 - `POST /zones/discover`, `/saved-views`, `/settings/smtp/test`
 - `PUT /zones/:id`, `/saved-views/:id`, `/settings/smtp`
-- `GET /export?type=requests&format=csv|json|ndjson`
 
-明细列表按 `(occurred_at, id)` 键集分页。contains 查询应限制时间范围；CSV 会防护 `= + - @` 公式注入。
+`/archives` 支持 `dataset`、`from`、`to`、`zones`，只返回匹配的已校验小时清单。明细筛选、按 `(occurredAt, id)` 分页和导出都由 WebUI 在浏览器本地完成；旧 `/requests`、`/security-events` 仅用于读取升级前遗留的 D1 行，`/export` 会提示改用网页本地导出。
 
 ## 许可证
 

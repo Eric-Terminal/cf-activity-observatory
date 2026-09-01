@@ -63,7 +63,10 @@ export async function evaluateAlerts(env: Env): Promise<void> {
     });
   }
   if (Number(usage?.d1_size_after ?? 0) >= Number(env.D1_WARNING_BYTES)) {
-    active.set("storage:d1", { title: "D1 存储达到安全水位", details: "系统将优先归档并清理最旧的完整小时。" });
+    active.set("storage:d1", {
+      title: "D1 存储达到安全水位",
+      details: "新采样明细已直接写入 R2；请备份后人工评估升级前遗留的 D1 明细，系统不会自动删除历史数据。",
+    });
   }
   if (Number(usage?.queue_messages ?? 0) >= 8_000) {
     active.set("budget:queue", { title: "Queue 每日安全预算已用尽", details: "当日 Queue 操作估算已达到预留 20% 后的安全水位。" });

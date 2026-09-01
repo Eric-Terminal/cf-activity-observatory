@@ -196,6 +196,30 @@ export interface PaginatedResult<T> {
   nextCursor: string | null;
 }
 
+export interface DetailFilter {
+  zoneIds: string[];
+  from: number;
+  to: number;
+  limit: number;
+  cursor?: string;
+  clientIp?: string;
+  country?: string;
+  asn?: number;
+  host?: string;
+  path?: string;
+  query?: string;
+  method?: string;
+  protocol?: string;
+  status?: number;
+  cacheStatus?: string;
+  securityAction?: string;
+  securitySource?: string;
+  rayId?: string;
+  userAgent?: string;
+  requestSource?: string;
+  ruleId?: string;
+}
+
 export interface CollectorHealth {
   status: "healthy" | "degraded" | "unconfigured";
   dataStatus: "complete" | "gaps" | "unconfigured";

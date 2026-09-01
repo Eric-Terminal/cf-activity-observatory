@@ -2,7 +2,7 @@
 
 [简体中文](./README.md) · [Archive schema](./docs/ARCHIVE_SCHEMA.md) · [Security policy](./SECURITY.md)
 
-CF Activity Observatory is a self-hosted HTTP activity and security analytics tool for Cloudflare Workers. It periodically reads the Cloudflare GraphQL Analytics API, persists short-lived sampled detail and sampling-adjusted trends in D1 and R2, and provides a Web UI for reviewing activity across days, weeks, and months.
+CF Activity Observatory is a self-hosted HTTP activity and security analytics tool for Cloudflare Workers. It writes sampled detail directly to R2, keeps sampling-adjusted trends and runtime state in D1, and provides a Web UI for reviewing activity across days, weeks, and months.
 
 > This project is not affiliated with or endorsed by Cloudflare, Inc. Cloudflare is a trademark of its respective owner.
 
@@ -23,9 +23,10 @@ Detail rows represent real requests, but not every request. Trend charts use Gro
 - Initial backfill from the discovered `notOlderThan` boundary and durable resume cursors.
 - Five-minute data stability delay and hourly repair queries for late arrivals.
 - Recursive window splitting for saturated pages and visible gap records when completeness cannot be guaranteed.
-- Combined filters, URL restoration, saved views, keyset pagination, and Cloudflare-style detail drawers.
+- Direct-to-R2 hourly sampled detail with browser-local decompression, filtering, keyset pagination, and CSV/JSON/NDJSON export.
+- Combined filters, URL restoration, saved views, and Cloudflare-style detail drawers.
 - Adjusted request/mitigation trends, action distribution, country map, and separate high-cardinality cubes for path, IP, ASN, User-Agent, and rules.
-- D1 online detail retention (90 days by default) and verified hourly gzip NDJSON archives in R2.
+- Schema v2 camelCase records with browser-side compatibility for existing schema v1 R2 archives.
 - Five-minute, hourly, and daily trend retention with a 400 MB D1 safety waterline.
 - Free-tier guards: 240 GraphQL calls per five minutes, 20% Queue reserve, and collection pause when the application-counted D1 writes reach 70% of the daily budget.
 - Cloudflare Access JWT verification, same-origin protection for writes, and strict security headers.
@@ -34,7 +35,7 @@ Detail rows represent real requests, but not every request. Trend charts use Gro
 
 ## Architecture
 
-The every-minute Cron dispatches bounded per-zone/per-dataset jobs to a Queue. Collectors query GraphQL and write detail, metrics, cursors, usage, and gaps to D1. Maintenance jobs aggregate metrics, write deterministic hourly archives to R2, verify object size/checksum metadata, and only then permit D1 detail pruning. The React/Vite SPA calls a Hono `/api/v1` API protected by Access.
+The every-minute Cron dispatches bounded per-zone/per-dataset jobs to a Queue. Collectors query GraphQL, merge detail into deterministic hourly R2 objects, and keep metrics, cursors, manifests, usage, and gaps in D1. Maintenance only ages metric tiers and evaluates alerts. The Access-protected API streams private archive objects; the React/Vite SPA decompresses, filters, paginates, and exports them locally in the browser.
 
 All persisted/API timestamps are UTC. The UI renders them in the browser's timezone.
 
@@ -103,16 +104,16 @@ Add a custom domain, then create a Cloudflare Access Self-hosted application for
 
 1. Sign in and open Settings & Health.
 2. Discover Cloudflare zones.
-3. Enable the desired zones and set polling/online retention.
+3. Enable the desired zones and set their polling interval.
 4. Review the discovered capabilities for all four datasets.
 5. Optionally configure SMTP and send a test message.
-6. Wait for two live polling cycles and confirm cursors, adjusted trends, sampled rows, and an R2 archive.
+6. Wait for two live polling cycles and confirm cursors, adjusted trends, and R2 sampled-detail archives in the explorer.
 
 ## Free-tier estimate
 
-One zone, four datasets, and a five-minute polling interval is estimated at about 3,456 Queue operations per day including send/receive/ack accounting. The UI estimates all enabled zones and rejects configurations above the 8,000/day safety budget, leaving room for repair, retries, archives, and other account activity.
+One zone, four datasets, and a five-minute polling interval is estimated at about 3,744 Queue operations per day including send/receive/ack accounting. The UI estimates all enabled zones and rejects configurations above the 8,000/day safety budget, leaving room for repair, retries, and other account activity.
 
-Historical backfill pauses at 20,000 application-counted D1 rows while live collection may continue. All collection pauses at 70,000 application-counted rows and resumes after the next UTC reset. The remaining 30% of the account-level allowance covers control and index writes not reflected in the application counter, queued work, and other databases in the same account.
+Sampled detail no longer writes to D1. D1 stores trend buckets, cursors, manifests, usage, and settings. Historical backfill pauses at 20,000 application-counted D1 writes while live collection may continue; all collection pauses at 70,000 and resumes after the next UTC reset. The remaining 30% covers control and index writes not reflected in the application counter, queued work, and other databases in the same account.
 
 Cloudflare limits can change; verify current limits before deployment. The application's counters estimate only its own usage, not other workloads in the account.
 
@@ -124,14 +125,14 @@ R2 keys use:
 archives/{zone_id}/{dataset}/YYYY/MM/DD/HH.ndjson.gz
 ```
 
-The first line contains schema metadata; each following line is one exported D1 row. See [docs/ARCHIVE_SCHEMA.md](./docs/ARCHIVE_SCHEMA.md) for checksums and restore guidance.
+The first line contains schema metadata; each following line is one deduplicated sampled-detail record. The Access-protected API streams private objects for local browser analysis, while raw gzip downloads remain available. See [docs/ARCHIVE_SCHEMA.md](./docs/ARCHIVE_SCHEMA.md) for checksums and compatibility details.
 
 To upgrade, back up D1/R2, pull the new tag, install the locked dependencies, apply remote migrations, and deploy. Roll back code by deploying the previous Git tag. Release Notes will call out any data migration that cannot be reversed safely.
 
 ## Security and privacy
 
 - Request bodies, Cookies, Authorization, and other request headers are not collected.
-- IP addresses, full query strings, and User-Agent values are investigation data; configure retention and access according to applicable law.
+- IP addresses, full query strings, and User-Agent values are investigation data; configure R2 lifecycle rules and access according to applicable law.
 - Sensitive request fields are excluded from structured logs, error summaries, and alert messages.
 - SMTP passwords are AES-GCM encrypted with the 32-byte `CONFIG_ENCRYPTION_KEY`. Losing that key requires re-entering the password.
 - A completely stopped Cron cannot alert on itself. Monitor `/api/v1/health` externally using an Access Service Token.

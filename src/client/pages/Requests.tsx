@@ -3,7 +3,8 @@ import { createColumnHelper, flexRender, getCoreRowModel, useReactTable } from "
 import { useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import type { SampledRequest } from "@/shared/contracts";
-import { api, endpoints } from "@/client/api";
+import { api } from "@/client/api";
+import { queryArchivedRequests } from "@/client/archive";
 import { useI18n } from "@/client/i18n";
 import { Notice, PageHeader } from "@/client/components/Layout";
 import { Badge, ErrorState, formatTime, Loading } from "@/client/components/Ui";
@@ -28,7 +29,11 @@ export function Requests() {
   });
   const renameView = useMutation({ mutationFn: ({ id, name, filters }: { id: string; name: string; filters: Record<string, string> }) => api(`/saved-views/${id}`, { method: "PUT", body: JSON.stringify({ name, page: "requests", filters }) }), onSuccess: async () => client.invalidateQueries({ queryKey: ["saved-views"] }) });
   const deleteView = useMutation({ mutationFn: (id: string) => api(`/saved-views/${id}`, { method: "DELETE" }), onSuccess: async () => { setSelectedViewId(""); await client.invalidateQueries({ queryKey: ["saved-views"] }); } });
-  const query = useQuery({ queryKey: ["requests", params.toString()], queryFn: () => endpoints.requests(params), placeholderData: (previous) => previous });
+  const query = useQuery({
+    queryKey: ["requests", params.toString()],
+    queryFn: ({ signal }) => queryArchivedRequests(params, signal),
+    placeholderData: (previous) => previous,
+  });
   const columns = useMemo(() => [
     column.accessor("occurredAt", { header: t("occurredAt"), cell: (info) => formatTime(info.getValue()) }),
     column.accessor("clientIp", { header: t("ip"), cell: (info) => info.getValue() ?? "—" }),
@@ -65,6 +70,7 @@ export function Requests() {
   return <>
     <PageHeader title={t("requests")} eyebrow={t("sampledDetail")} actions={<><div className="saved-view-actions"><select aria-label={t("savedViews")} value={selectedViewId} onChange={(event) => { setSelectedViewId(event.target.value); const view = savedViews.data?.items.find((item) => item.id === event.target.value); if (view) { const next = new URLSearchParams(view.filters); setDraft(view.filters); setHistory([]); setParams(next); } }}><option value="">{t("savedViews")}</option>{savedViews.data?.items.filter((item) => item.page === "requests").map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select><button onClick={() => { const name = window.prompt(t("viewName")); if (name?.trim()) saveView.mutate(name.trim()); }}>{t("saveCurrentView")}</button>{selectedViewId && <><button onClick={() => { const view = savedViews.data?.items.find((item) => item.id === selectedViewId); const name = window.prompt(t("viewName"), view?.name); if (view && name?.trim()) renameView.mutate({ id: view.id, name: name.trim(), filters: view.filters }); }}>{t("rename")}</button><button onClick={() => deleteView.mutate(selectedViewId)}>{t("delete")}</button></>}</div><TimeControls range={range} setRange={(nextRange) => { const dates = rangeDates(nextRange); const next = new URLSearchParams(params); next.set("from", dates.from); next.set("to", dates.to); next.delete("cursor"); setRangeState(nextRange); setHistory([]); setParams(next); }} /></>} />
     <Notice><strong>{t("sampling")}</strong><span>{t("samplingHelp")}</span></Notice>
+    <Notice><strong>{t("browserArchive")}</strong><span>{t("browserArchiveHelp")}</span></Notice>
     <form className="filter-panel" onSubmit={applyFilters}>
       <header><h2>{t("filters")}</h2><button type="button" className="ghost" onClick={() => { const dates = rangeDates("24h"); setDraft({}); setParams(new URLSearchParams({ ...dates, limit: "100" })); }}>{t("reset")}</button></header>
       <div className="filter-grid">

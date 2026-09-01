@@ -8,8 +8,8 @@ import {
   processCollectJob,
   retryDelay,
 } from "@/worker/collector";
-import { runMaintenance } from "@/worker/archive";
-import { csvCell, estimateDailyQueueOperations } from "@/worker/api";
+import { archiveDetailRows, runMaintenance } from "@/worker/archive";
+import { estimateDailyQueueOperations } from "@/worker/api";
 import { dotStuff, mimeMessage } from "@/worker/smtp";
 import { CloudflareApiError } from "@/worker/cloudflare";
 import { alertNeedsNotification, evaluateAlerts } from "@/worker/alerts";
@@ -141,7 +141,7 @@ describe("Worker API 与存储", () => {
     expect(body.items[0]?.rayId).toBe("ray-one");
   });
 
-  it("重复采集同一明细时补齐 ASN 且不产生重复记录", async () => {
+  it("重复采集同一明细时在 R2 补齐 ASN 且不产生重复记录", async () => {
     const timestamp = Date.now() - 10 * 60_000;
     await insertZone("zone-collect", "collect.example");
     await env.DB.prepare(
@@ -165,8 +165,36 @@ describe("Worker API 与存储", () => {
     const base = { version: 1 as const, type: "collect" as const, zoneId: "zone-collect", dataset: "httpRequestsAdaptive" as const, start: timestamp - 1000, end: timestamp + 1000, mode: "repair" as const };
     await processCollectJob(env, { ...base, id: "collect-one" });
     await processCollectJob(env, { ...base, id: "collect-two" });
-    const stored = await env.DB.prepare("SELECT COUNT(*) AS count, MAX(asn) AS asn FROM request_samples WHERE zone_id = 'zone-collect'").first<{ count: number; asn: number | null }>();
-    expect(stored).toEqual({ count: 1, asn: 64500 });
+    const stored = await env.DB.prepare("SELECT COUNT(*) AS count FROM request_samples WHERE zone_id = 'zone-collect'").first<{ count: number }>();
+    expect(stored?.count).toBe(0);
+    const manifest = await env.DB.prepare(
+      `SELECT r2_key, record_count, schema_version, pruned_at FROM archive_manifests
+       WHERE zone_id = 'zone-collect' AND dataset = 'httpRequestsAdaptive'`,
+    ).first<{ r2_key: string; record_count: number; schema_version: number; pruned_at: number | null }>();
+    expect(manifest).toMatchObject({ record_count: 1, schema_version: 2 });
+    expect(manifest?.pruned_at).not.toBeNull();
+    const object = await env.ARCHIVES.get(manifest?.r2_key ?? "missing");
+    const archive = object ? await gunzipText(object.body) : "";
+    const rows = archive.trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+    expect(rows[0]).toMatchObject({ schemaVersion: 2, dataset: "httpRequestsAdaptive" });
+    expect(rows[1]).toMatchObject({ asn: 64500, clientIp: "198.51.100.2" });
+
+    const url = new URL("http://localhost/api/v1/archives");
+    url.searchParams.set("dataset", "httpRequestsAdaptive");
+    url.searchParams.set("from", new Date(timestamp - 60_000).toISOString());
+    url.searchParams.set("to", new Date(timestamp + 60_000).toISOString());
+    url.searchParams.set("zones", "zone-collect");
+    const index = await (await exports.default.fetch(url.toString())).json<{ items: Array<{ id: string }> }>();
+    expect(index.items).toHaveLength(1);
+
+    await env.DB.prepare("UPDATE archive_manifests SET etag = 'stale-etag' WHERE r2_key = ?")
+      .bind(manifest?.r2_key)
+      .run();
+    await archiveDetailRows(env, "httpRequestsAdaptive", "zone-collect", repairedPayload.data.viewer.zones[0].httpRequestsAdaptive);
+    const repairedManifest = await env.DB.prepare(
+      "SELECT etag FROM archive_manifests WHERE r2_key = ?",
+    ).bind(manifest?.r2_key).first<{ etag: string }>();
+    expect(repairedManifest?.etag).not.toBe("stale-etag");
   });
 
   it("聚合总量不会重复计入高基数排名 cube", async () => {
@@ -282,7 +310,7 @@ describe("Worker API 与存储", () => {
     }]);
   });
 
-  it("归档经 R2 校验后写入 verified manifest", async () => {
+  it("维护任务不再扫描和删除旧 D1 明细", async () => {
     const occurredAt = Math.floor((Date.now() - 3 * 3_600_000) / 3_600_000) * 3_600_000;
     await insertZone("zone-archive", "archive.example");
     await env.DB.prepare(
@@ -291,9 +319,14 @@ describe("Worker API 与存储", () => {
        VALUES ('archive-event', 'zone-archive', ?, 'archive-ray', 'block', 'firewallRules', ?, 'test', '{}')`,
     ).bind(occurredAt, Date.now()).run();
     await runMaintenance(env);
-    const manifest = await env.DB.prepare("SELECT status, r2_key FROM archive_manifests WHERE zone_id = 'zone-archive'").first<{ status: string; r2_key: string }>();
-    expect(manifest?.status).toBe("verified");
-    expect(await env.ARCHIVES.head(manifest?.r2_key ?? "missing")).not.toBeNull();
+    const stored = await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM security_events WHERE zone_id = 'zone-archive'",
+    ).first<{ count: number }>();
+    const manifest = await env.DB.prepare(
+      "SELECT id FROM archive_manifests WHERE zone_id = 'zone-archive'",
+    ).first<{ id: string }>();
+    expect(stored?.count).toBe(1);
+    expect(manifest).toBeNull();
   });
 
   it("D1 总写入预算为账户保留 30% 安全余量", () => {
@@ -694,7 +727,6 @@ describe("安全边界与协议细节", () => {
     expect(estimateDailyQueueOperations([{ enabled: true, pollIntervalMinutes: 5 }])).toBe(3_744);
     expect(estimateDailyQueueOperations([{ enabled: false, pollIntervalMinutes: 1 }])).toBe(0);
   });
-  it("阻止 CSV 公式注入", () => expect(csvCell("=WEBSERVICE(\"bad\")")).toBe("\"'=WEBSERVICE(\"\"bad\"\")\""));
   it("执行 SMTP dot stuffing 并生成标准 MIME", () => {
     expect(dotStuff("a\n.hidden\n..double")).toBe("a\r\n..hidden\r\n...double");
     const mime = mimeMessage({ enabled: true, host: "smtp.example", port: 465, tlsMode: "implicit", authMethod: "plain", username: "u", senderName: "观测站", senderAddress: "from@example.com", recipients: ["to@example.com"], subjectPrefix: "[Test]", clearPassword: false }, { subject: "正常", text: "正文" });
@@ -731,4 +763,9 @@ async function setD1Writes(rows: number, timestamp = Date.now()): Promise<void> 
     `INSERT INTO usage_daily (day, d1_rows_written, updated_at) VALUES (?, ?, ?)
      ON CONFLICT(day) DO UPDATE SET d1_rows_written = excluded.d1_rows_written, updated_at = excluded.updated_at`,
   ).bind(day, rows, timestamp).run();
+}
+
+async function gunzipText(body: ReadableStream): Promise<string> {
+  const decompressed = body.pipeThrough(new DecompressionStream("gzip"));
+  return new Response(decompressed).text();
 }

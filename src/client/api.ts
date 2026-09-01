@@ -62,6 +62,7 @@ export interface ArchiveItem {
   archived_at: number;
   verified_at: number | null;
   pruned_at: number | null;
+  schema_version: number;
 }
 
 export interface AppSettings {
@@ -80,6 +81,6 @@ export const endpoints = {
   events: (query: URLSearchParams) => api<PaginatedResult<SecurityEvent>>(`/security-events?${query}`),
   event: (id: string) => api<SecurityEvent>(`/security-events/${encodeURIComponent(id)}`),
   health: (query?: URLSearchParams) => api<CollectorHealth>(`/health${query?.size ? `?${query}` : ""}`),
-  archives: () => api<{ items: ArchiveItem[] }>("/archives"),
+  archives: (query?: URLSearchParams) => api<{ items: ArchiveItem[] }>(`/archives${query?.size ? `?${query}` : ""}`),
   settings: () => api<AppSettings>("/settings"),
 };
