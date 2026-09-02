@@ -1,5 +1,5 @@
 import type { CollectorJob, DatasetCapability, DatasetName } from "@/shared/contracts";
-import { DATASETS, GROUP_DATASETS } from "@/shared/contracts";
+import { DATASETS, GROUP_DATASETS, RAW_DATASETS } from "@/shared/contracts";
 import {
   CloudflareApiError,
   fetchDatasetWindow,
@@ -127,7 +127,12 @@ export async function processCollectJob(
 ): Promise<CollectOutcome> {
   const rowsWritten = await d1RowsWrittenToday(env.DB);
   const budgetClass = job.budgetClass ?? (job.mode === "backfill" ? "backfill" : "live");
-  if (rowsWritten >= D1_DAILY_WRITE_PAUSE || (budgetClass === "backfill" && rowsWritten >= D1_DAILY_BACKFILL_PAUSE)) {
+  const detailWritesToR2 = RAW_DATASETS.includes(job.dataset as (typeof RAW_DATASETS)[number]);
+  // 20k 水位只保护会批量写 D1 的趋势回填；R2 明细仍受 70k 总水位保护其控制语句。
+  const backfillPaused = !detailWritesToR2
+    && budgetClass === "backfill"
+    && rowsWritten >= D1_DAILY_BACKFILL_PAUSE;
+  if (rowsWritten >= D1_DAILY_WRITE_PAUSE || backfillPaused) {
     await deferCollectJob(env, job, secondsUntilUtcReset(nowMs()));
     return "budget-paused";
   }

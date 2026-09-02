@@ -479,7 +479,7 @@ describe("Worker API 与存储", () => {
     ).first()).toBeNull();
   });
 
-  it("历史回填达到独立预算后暂停但实时修复仍可继续", async () => {
+  it("R2 明细回填超过 D1 趋势预算后仍可继续", async () => {
     const timestamp = Date.now();
     await insertZone("zone-backfill-budget", "backfill-budget.example");
     await env.DB.prepare(
@@ -522,9 +522,36 @@ describe("Worker API 与存储", () => {
       budgetClass: "live",
     });
 
-    expect(backfill).toBe("budget-paused");
+    expect(backfill).toBe("collected");
     expect(live).toBe("collected");
-    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("趋势回填达到独立 D1 预算后仍会暂停", async () => {
+    const timestamp = Date.now();
+    await insertZone("zone-trend-budget", "trend-budget.example");
+    await env.DB.prepare(
+      `INSERT INTO sync_cursors (zone_id, dataset, cursor_at, consecutive_failures, in_flight_until, updated_at)
+       VALUES ('zone-trend-budget', 'httpRequestsAdaptiveGroups', ?, 0, ?, ?)`,
+    ).bind(timestamp - 60_000, timestamp + 15 * 60_000, timestamp).run();
+    await setD1Writes(20_000, timestamp);
+    const fetchMock = vi.fn(() => Promise.reject(new Error("趋势预算暂停时不应请求 Cloudflare")));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const outcome = await processCollectJob(env, {
+      version: 1,
+      type: "collect",
+      id: "trend-backfill-budget-job",
+      zoneId: "zone-trend-budget",
+      dataset: "httpRequestsAdaptiveGroups",
+      start: timestamp - 60_000,
+      end: timestamp,
+      mode: "backfill",
+      budgetClass: "backfill",
+    });
+
+    expect(outcome).toBe("budget-paused");
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("饱和窗口拆成两个续传任务并留下可追踪缺口", async () => {

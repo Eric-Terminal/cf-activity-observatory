@@ -125,7 +125,7 @@ node ./node_modules/wrangler/bin/wrangler.js secret put ACCESS_AUD
 node ./node_modules/wrangler/bin/wrangler.js d1 migrations apply DB --remote
 pnpm check
 pnpm wrangler:dry-run
-pnpm deploy
+pnpm run deploy
 ```
 
 部署后为 Worker 添加自定义域名。项目关闭了 `workers.dev` 和 Preview URL，避免绕过 Access。
@@ -153,7 +153,7 @@ Worker 会按照 Cloudflare 的 [Access JWT 验证方式](https://developers.clo
 
 默认按 Workers Free 的常见额度设计。单 Zone、四个数据集、5 分钟频率的基础 Queue 发送/接收/确认估算约 3744 次/日，另外预留修复、重试和用户其他调用。设置页计算所有 Zone 的预计消耗；超过 8000 次/日会拒绝保存。
 
-采样明细不再写入 D1；D1 仅保存趋势桶、游标、清单、用量与设置。历史回填达到应用内 20,000 行写入计数后延迟到下一个 UTC 日，应用内总写入计数达到 70,000 行时暂停采集并在额度重置后补采。30% 的账户级余量用于覆盖应用未回计的控制语句与索引写入、已入队任务及同账户其他数据库。趋势表使用复合主键和一棵查询索引，并且不会同时保存 5 分钟、小时、每日三份副本。
+采样明细不再写入 D1；D1 仅保存趋势桶、游标、清单、用量与设置。趋势历史回填达到应用内 20,000 行写入计数后延迟到下一个 UTC 日，R2 明细回填可继续；应用内总写入计数达到 70,000 行时暂停全部采集并在额度重置后补采。30% 的账户级余量用于覆盖应用未回计的控制语句与索引写入、已入队任务及同账户其他数据库。趋势表使用复合主键和一棵查询索引，并且不会同时保存 5 分钟、小时、每日三份副本。
 
 Cloudflare 产品额度可能调整，以部署时的官方套餐页为准。程序记录自身产生的 GraphQL、Queue、D1 和 R2 估算，不代表账号中其他应用的用量。
 
@@ -173,7 +173,7 @@ archives/{zone_id}/{dataset}/YYYY/MM/DD/HH.ndjson.gz
 git pull --ff-only
 pnpm install --frozen-lockfile
 node ./node_modules/wrangler/bin/wrangler.js d1 migrations apply DB --remote
-pnpm deploy
+pnpm run deploy
 ```
 
 Worker 代码可通过重新部署上一 Git tag 回滚；包含破坏性数据迁移的版本会在 Release Notes 单独说明。

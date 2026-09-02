@@ -93,7 +93,7 @@ Apply migrations and deploy:
 node ./node_modules/wrangler/bin/wrangler.js d1 migrations apply DB --remote
 pnpm check
 pnpm wrangler:dry-run
-pnpm deploy
+pnpm run deploy
 ```
 
 Add a custom domain, then create a Cloudflare Access Self-hosted application for that hostname. Configure GitHub OAuth or another identity provider and an Allow policy. Store the Team domain and application AUD in the two Access secrets. The Worker validates RS256 signature, issuer, and AUD according to Cloudflare's [Access JWT validation guide](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/authorization-cookie/validating-json/).
@@ -113,7 +113,7 @@ Add a custom domain, then create a Cloudflare Access Self-hosted application for
 
 One zone, four datasets, and a five-minute polling interval is estimated at about 3,744 Queue operations per day including send/receive/ack accounting. The UI estimates all enabled zones and rejects configurations above the 8,000/day safety budget, leaving room for repair, retries, and other account activity.
 
-Sampled detail no longer writes to D1. D1 stores trend buckets, cursors, manifests, usage, and settings. Historical backfill pauses at 20,000 application-counted D1 writes while live collection may continue; all collection pauses at 70,000 and resumes after the next UTC reset. The remaining 30% covers control and index writes not reflected in the application counter, queued work, and other databases in the same account.
+Sampled detail no longer writes to D1. D1 stores trend buckets, cursors, manifests, usage, and settings. Trend backfill pauses at 20,000 application-counted D1 writes while R2 detail backfill and live collection may continue; all collection pauses at 70,000 and resumes after the next UTC reset. The remaining 30% covers control and index writes not reflected in the application counter, queued work, and other databases in the same account.
 
 Cloudflare limits can change; verify current limits before deployment. The application's counters estimate only its own usage, not other workloads in the account.
 
