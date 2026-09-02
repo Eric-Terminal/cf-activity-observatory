@@ -8,7 +8,13 @@ import {
   processCollectJob,
   retryDelay,
 } from "@/worker/collector";
-import { archiveDetailRows, runMaintenance } from "@/worker/archive";
+import {
+  archiveDetailRows,
+  type ArchiveManifestRow,
+  runMaintenance,
+  verifyArchiveObject,
+} from "@/worker/archive";
+import historyWorker from "../../scripts/archive-d1-history";
 import { estimateDailyQueueOperations } from "@/worker/api";
 import { dotStuff, mimeMessage } from "@/worker/smtp";
 import { CloudflareApiError } from "@/worker/cloudflare";
@@ -327,6 +333,46 @@ describe("Worker API 与存储", () => {
     ).first<{ id: string }>();
     expect(stored?.count).toBe(1);
     expect(manifest).toBeNull();
+  });
+
+  it("本地运维工具把 D1 历史明细补入 R2 并可完整回读校验", async () => {
+    const occurredAt = Math.floor((Date.now() - 3 * 3_600_000) / 3_600_000) * 3_600_000;
+    await insertZone("000-history", "history.example");
+    await env.DB.prepare(
+      `INSERT INTO security_events
+       (id, zone_id, occurred_at, ray_id, client_ip, host, path, method, action, source, collected_at, batch_id, extra)
+       VALUES ('history-event', '000-history', ?, 'history-ray', '192.0.2.8', 'history.example',
+        '/audit', 'GET', 'block', 'firewallRules', ?, 'history-test', '{}')`,
+    ).bind(occurredAt, Date.now()).run();
+
+    const response = await historyWorker.fetch(new Request("http://localhost/backfill", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    }), env);
+    expect(response.status).toBe(200);
+    const result = await response.json<{ items: Array<{ d1Records: number; changedRecords: number }> }>();
+    expect(result.items).toContainEqual(expect.objectContaining({
+      zoneId: "000-history",
+      d1Records: 1,
+      changedRecords: 1,
+    }));
+
+    const manifest = await env.DB.prepare(
+      `SELECT id, zone_id, dataset, range_start, range_end, r2_key, record_count, compressed_bytes,
+        sha256, etag, schema_version, status, archived_at, verified_at, pruned_at
+       FROM archive_manifests WHERE zone_id = '000-history'`,
+    ).first<ArchiveManifestRow>();
+    expect(manifest?.pruned_at).toBeNull();
+    await expect(verifyArchiveObject(env.ARCHIVES, manifest!)).resolves.toMatchObject({ records: 1, schemaVersion: 2 });
+
+    const verifyResponse = await historyWorker.fetch(new Request("http://localhost/verify"), env);
+    expect(verifyResponse.status).toBe(200);
+    const verification = await verifyResponse.json<{ objects: number; records: number }>();
+    expect(verification.objects).toBeGreaterThanOrEqual(1);
+    expect(verification.records).toBeGreaterThanOrEqual(1);
+    const remoteResponse = await historyWorker.fetch(new Request("https://example.com/verify"), env);
+    expect(remoteResponse.status).toBe(403);
   });
 
   it("D1 总写入预算为账户保留 30% 安全余量", () => {

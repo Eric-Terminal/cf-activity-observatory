@@ -22,6 +22,7 @@ import {
 } from "@/worker/utils";
 
 const ARCHIVE_SCHEMA_VERSION = 2;
+type ArchiveEnv = Pick<Env, "DB" | "ARCHIVES">;
 
 export interface ArchiveManifestRow {
   id: string;
@@ -58,16 +59,35 @@ export async function runMaintenance(env: Env, scheduledAt = nowMs()): Promise<v
 }
 
 export async function archiveDetailRows(
-  env: Env,
+  env: ArchiveEnv,
   dataset: RawArchiveDataset,
   zoneId: string,
   rows: Array<Record<string, unknown>>,
 ): Promise<number> {
+  const records = rows.map((row) => dataset === "httpRequestsAdaptive"
+    ? requestFromCloudflare(zoneId, row)
+    : eventFromCloudflare(zoneId, row));
+  return archiveRecords(env, dataset, zoneId, records, false);
+}
+
+export async function archiveStoredDetailRows(
+  env: ArchiveEnv,
+  dataset: RawArchiveDataset,
+  zoneId: string,
+  records: ArchiveRecord[],
+): Promise<number> {
+  return archiveRecords(env, dataset, zoneId, records, true);
+}
+
+async function archiveRecords(
+  env: ArchiveEnv,
+  dataset: RawArchiveDataset,
+  zoneId: string,
+  records: ArchiveRecord[],
+  preserveD1: boolean,
+): Promise<number> {
   const grouped = new Map<number, ArchiveRecord[]>();
-  for (const row of rows) {
-    const item = dataset === "httpRequestsAdaptive"
-      ? requestFromCloudflare(zoneId, row)
-      : eventFromCloudflare(zoneId, row);
+  for (const item of records) {
     const hourStart = floorTo(item.occurredAt, HOUR_MS);
     const group = grouped.get(hourStart) ?? [];
     group.push(item);
@@ -75,7 +95,7 @@ export async function archiveDetailRows(
   }
   let changed = 0;
   for (const [hourStart, incoming] of grouped) {
-    changed += await writeArchiveHour(env, dataset, zoneId, hourStart, incoming);
+    changed += await writeArchiveHour(env, dataset, zoneId, hourStart, incoming, preserveD1);
   }
   return changed;
 }
@@ -125,11 +145,12 @@ export async function getArchive(database: D1Database, id: string): Promise<Arch
 }
 
 async function writeArchiveHour(
-  env: Env,
+  env: ArchiveEnv,
   dataset: RawArchiveDataset,
   zoneId: string,
   hourStart: number,
   incoming: ArchiveRecord[],
+  preserveD1: boolean,
 ): Promise<number> {
   const key = archiveKey(zoneId, dataset, hourStart);
   const existingObject = await env.ARCHIVES.get(key);
@@ -187,7 +208,7 @@ async function writeArchiveHour(
     .bind(
       stableId(zoneId, dataset, hourStart), zoneId, dataset, hourStart, hourStart + HOUR_MS, key,
       records.length, compressed.byteLength, checksum, object?.etag ?? head.etag, ARCHIVE_SCHEMA_VERSION,
-      timestamp, timestamp, timestamp,
+      timestamp, timestamp, preserveD1 ? null : timestamp,
     )
     .run();
   await recordD1Usage(env.DB, manifest.meta);
@@ -197,14 +218,73 @@ async function writeArchiveHour(
 
 async function readArchive(object: R2ObjectBody, expectedDataset: RawArchiveDataset): Promise<ArchiveRecord[]> {
   const compressed = new Uint8Array(await new Response(object.body).arrayBuffer());
+  return (await decodeArchive(compressed, expectedDataset)).records;
+}
+
+export interface ArchiveVerification {
+  key: string;
+  records: number;
+  compressedBytes: number;
+  sha256: string;
+  schemaVersion: number;
+}
+
+export async function verifyArchiveObject(
+  bucket: R2Bucket,
+  manifest: ArchiveManifestRow,
+): Promise<ArchiveVerification> {
+  const object = await bucket.get(manifest.r2_key);
+  if (!object) throw new Error(`R2 归档对象不存在：${manifest.r2_key}`);
+  const compressed = new Uint8Array(await new Response(object.body).arrayBuffer());
+  if (compressed.byteLength !== manifest.compressed_bytes) {
+    throw new Error(`R2 归档大小不匹配：${manifest.r2_key}`);
+  }
+  const checksum = bytesToBase64Url(new Uint8Array(await crypto.subtle.digest("SHA-256", exactBuffer(compressed))));
+  if (checksum !== manifest.sha256) throw new Error(`R2 归档校验和不匹配：${manifest.r2_key}`);
+  if (manifest.etag && object.etag !== manifest.etag) throw new Error(`R2 归档 ETag 不匹配：${manifest.r2_key}`);
+  if (object.customMetadata?.sha256 && object.customMetadata.sha256 !== checksum) {
+    throw new Error(`R2 归档元数据校验和不匹配：${manifest.r2_key}`);
+  }
+  const decoded = await decodeArchive(compressed, manifest.dataset as RawArchiveDataset);
+  if (
+    decoded.header.zoneId !== manifest.zone_id
+    || decoded.header.rangeStart !== new Date(manifest.range_start).toISOString()
+    || decoded.header.rangeEnd !== new Date(manifest.range_end).toISOString()
+  ) throw new Error(`R2 归档头与 manifest 不匹配：${manifest.r2_key}`);
+  if (decoded.records.length !== manifest.record_count) {
+    throw new Error(`R2 归档记录数不匹配：${manifest.r2_key}`);
+  }
+  if (new Set(decoded.records.map((item) => item.id)).size !== decoded.records.length) {
+    throw new Error(`R2 归档包含重复记录：${manifest.r2_key}`);
+  }
+  if (decoded.records.some((item) => (
+    item.zoneId !== manifest.zone_id
+    || item.occurredAt < manifest.range_start
+    || item.occurredAt >= manifest.range_end
+  ))) throw new Error(`R2 归档记录越出 manifest 范围：${manifest.r2_key}`);
+  return {
+    key: manifest.r2_key,
+    records: decoded.records.length,
+    compressedBytes: compressed.byteLength,
+    sha256: checksum,
+    schemaVersion: decoded.header.schemaVersion,
+  };
+}
+
+async function decodeArchive(
+  compressed: Uint8Array,
+  expectedDataset: RawArchiveDataset,
+): Promise<{ header: NonNullable<ReturnType<typeof parseArchiveHeader>>; records: ArchiveRecord[] }> {
   const text = new TextDecoder().decode(await gunzip(compressed));
   const lines = text.split("\n").filter(Boolean);
   const header = parseArchiveHeader(JSON.parse(lines.shift() ?? "null") as unknown);
-  if (!header || header.dataset !== expectedDataset) throw new Error(`R2 归档头无效：${object.key}`);
-  return lines.flatMap((line) => {
+  if (!header || header.dataset !== expectedDataset) throw new Error(`R2 归档头无效：${expectedDataset}`);
+  const records = lines.map((line) => {
     const item = parseArchiveRecord(expectedDataset, header.schemaVersion, JSON.parse(line) as unknown);
-    return item ? [item] : [];
+    if (!item) throw new Error(`R2 归档记录无效：${expectedDataset}`);
+    return item;
   });
+  return { header, records };
 }
 
 function mergeRepair(previous: ArchiveRecord, incoming: ArchiveRecord): ArchiveRecord {

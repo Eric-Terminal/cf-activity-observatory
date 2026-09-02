@@ -1,0 +1,24 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "cf-activity-observatory-history-backfill",
+  "main": "./scripts/archive-d1-history.ts",
+  "compatibility_date": "2026-08-04",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "preview_urls": false,
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "cf-activity-observatory",
+      "database_id": "11208ca7-c594-475f-a9ac-a96a89dca926",
+      "remote": true
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "ARCHIVES",
+      "bucket_name": "cf-activity-observatory-archives",
+      "remote": true
+    }
+  ]
+}
