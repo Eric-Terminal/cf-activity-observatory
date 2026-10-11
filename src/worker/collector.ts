@@ -7,6 +7,9 @@ import {
   type DatasetResult,
 } from "@/worker/cloudflare";
 import { archiveDetailRows } from "@/worker/archive";
+import { usesLogpush } from "@/worker/logpush";
+import { storeMetricRows } from "@/worker/metric-archive";
+import type { StoredMetric } from "@/shared/metrics";
 import { getCapability, incrementUsage, recordD1Usage } from "@/worker/db";
 import {
   D1_DAILY_BACKFILL_PAUSE,
@@ -67,6 +70,7 @@ export async function dispatchScheduled(env: Env, scheduledAt = nowMs()): Promis
   for (const zone of due.results) {
     await ensureCapabilities(env, zone.id);
     for (const dataset of DATASETS) {
+      if (await usesLogpush(env.DB, zone.id, dataset)) continue;
       const capability = await getCapability(env.DB, zone.id, dataset);
       if (!capability?.enabled) continue;
       const acquired = await acquireWindow(env, zone.id, dataset, capability, scheduledAt);
@@ -125,6 +129,8 @@ export async function processCollectJob(
   env: Env,
   job: Extract<CollectorJob, { type: "collect" }>,
 ): Promise<CollectOutcome> {
+  // 来源切换后，已排队的旧明细任务也必须停止，避免补采覆盖新的日志来源。
+  if (await usesLogpush(env.DB, job.zoneId, job.dataset)) return "collected";
   const rowsWritten = await d1RowsWrittenToday(env.DB);
   const budgetClass = job.budgetClass ?? (job.mode === "backfill" ? "backfill" : "live");
   const detailWritesToR2 = RAW_DATASETS.includes(job.dataset as (typeof RAW_DATASETS)[number]);
@@ -352,17 +358,10 @@ async function persistRows(
   if (dataset === "httpRequestsAdaptive" || dataset === "firewallEventsAdaptive") {
     return archiveDetailRows(env, dataset, zoneId, result.rows);
   }
-  const statements = result.rows.map((row) => metricStatement(env.DB, dataset, zoneId, row));
-  let changes = 0;
-  for (let index = 0; index < statements.length; index += 80) {
-    const batch = await env.DB.batch(statements.slice(index, index + 80));
-    changes += batch.reduce((sum, item) => sum + item.meta.changes, 0);
-    await recordD1Usage(env.DB, batch.map((item) => item.meta));
-  }
-  return changes;
+  return storeMetricRows(env, result.rows.map((row) => metricRecord(dataset, zoneId, row)));
 }
 
-function metricStatement(database: D1Database, dataset: DatasetName, zoneId: string, row: Record<string, unknown>): D1PreparedStatement {
+function metricRecord(dataset: DatasetName, zoneId: string, row: Record<string, unknown>): StoredMetric {
   const dimensions = asRecord(row.dimensions);
   const sum = asRecord(row.sum);
   const average = asRecord(row.avg);
@@ -403,32 +402,16 @@ function metricStatement(database: D1Database, dataset: DatasetName, zoneId: str
     securitySource,
     statusClass: status,
   });
-  return database.prepare(
-    `INSERT INTO metric_buckets
-     (zone_id, bucket_start, bucket_seconds, metric_kind, dimension_signature, host, country, asn,
-      method, protocol, edge_status, origin_status, status_class, cache_status, security_action, security_source, request_source,
-      dimension_type, dimension_value, estimated_count, sample_interval, confidence_estimate, confidence_lower,
-      confidence_upper, confidence_sample_size, edge_response_bytes, visits, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(zone_id, bucket_start, bucket_seconds, metric_kind, dimension_signature) DO UPDATE SET
-      estimated_count = excluded.estimated_count, sample_interval = excluded.sample_interval,
-      confidence_estimate = excluded.confidence_estimate, confidence_lower = excluded.confidence_lower,
-      confidence_upper = excluded.confidence_upper, confidence_sample_size = excluded.confidence_sample_size,
-      edge_response_bytes = excluded.edge_response_bytes, visits = excluded.visits, updated_at = excluded.updated_at
-     WHERE metric_buckets.estimated_count IS NOT excluded.estimated_count
-        OR metric_buckets.sample_interval IS NOT excluded.sample_interval
-        OR metric_buckets.confidence_estimate IS NOT excluded.confidence_estimate
-        OR metric_buckets.confidence_lower IS NOT excluded.confidence_lower
-        OR metric_buckets.confidence_upper IS NOT excluded.confidence_upper
-        OR metric_buckets.confidence_sample_size IS NOT excluded.confidence_sample_size
-        OR metric_buckets.edge_response_bytes IS NOT excluded.edge_response_bytes
-        OR metric_buckets.visits IS NOT excluded.visits`,
-  ).bind(
-    zoneId, bucketStart, bucketSeconds, metricKind, signature, host, country, asn, method, protocol, edgeStatus,
-    originStatus, status, cacheStatus, securityAction, securitySource, requestSource, dimensionType, dimensionValue,
-    estimated, asNumber(average.sampleInterval), asNumber(confidenceMetric.estimate), asNumber(confidenceMetric.lower),
-    asNumber(confidenceMetric.upper), asNumber(confidenceMetric.sampleSize), asNumber(sum.edgeResponseBytes), asNumber(sum.visits), nowMs(),
-  );
+  return {
+    zone_id: zoneId, bucket_start: bucketStart, bucket_seconds: bucketSeconds, metric_kind: metricKind,
+    dimension_signature: signature, host, country, asn, method, protocol, edge_status: edgeStatus,
+    origin_status: originStatus, status_class: status, cache_status: cacheStatus, security_action: securityAction,
+    security_source: securitySource, request_source: requestSource, dimension_type: dimensionType, dimension_value: dimensionValue,
+    estimated_count: estimated, sample_interval: asNumber(average.sampleInterval), confidence_estimate: asNumber(confidenceMetric.estimate),
+    confidence_lower: asNumber(confidenceMetric.lower), confidence_upper: asNumber(confidenceMetric.upper),
+    confidence_sample_size: asNumber(confidenceMetric.sampleSize), edge_response_bytes: asNumber(sum.edgeResponseBytes),
+    visits: asNumber(sum.visits), updated_at: nowMs(),
+  };
 }
 
 function rankingValue(dimensions: Record<string, unknown>, type: string | null): string | null {
@@ -481,6 +464,7 @@ async function enqueueHourlyRepairs(env: Env, scheduledAt: number): Promise<void
   let sent = 0;
   for (const row of rows.results) {
     if (!DATASETS.includes(row.dataset as DatasetName)) continue;
+    if (await usesLogpush(env.DB, row.zone_id, row.dataset)) continue;
     await env.COLLECTOR_QUEUE.send({
       version: 1,
       type: "collect",

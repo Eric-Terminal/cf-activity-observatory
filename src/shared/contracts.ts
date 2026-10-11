@@ -32,6 +32,18 @@ export const collectorJobSchema = z.discriminatedUnion("type", [
     id: z.string().min(1),
     scheduledAt: z.number().int().nonnegative(),
   }),
+  z.object({
+    version: z.literal(1),
+    type: z.literal("index-logpush"),
+    key: z.string().startsWith("logpush/").max(1024),
+  }),
+  z.object({
+    version: z.literal(1),
+    type: z.literal("reconcile-logpush"),
+    zoneId: z.string().regex(/^[a-f0-9]{32}$/u),
+    dataset: z.enum(["http_requests", "firewall_events"]),
+    cursor: z.string().optional(),
+  }),
 ]);
 
 export type CollectorJob = z.infer<typeof collectorJobSchema>;
@@ -114,6 +126,7 @@ export interface DatasetCapability {
 }
 
 export interface SampledRequest {
+  dataSource?: "graphql" | "logpush";
   id: string;
   zoneId: string;
   occurredAt: number;
@@ -150,6 +163,7 @@ export interface SampledRequest {
 }
 
 export interface SecurityEvent {
+  dataSource?: "graphql" | "logpush";
   id: string;
   zoneId: string;
   occurredAt: number;

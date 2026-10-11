@@ -8,6 +8,7 @@
   "preview_urls": false,
   "vars": {
     "ENVIRONMENT": "production",
+    "ARCHIVE_BUCKET_NAME": "cf-activity-observatory-archives",
     "GRAPHQL_API_URL": "https://api.cloudflare.com/client/v4/graphql",
     "CLOUDFLARE_API_URL": "https://api.cloudflare.com/client/v4",
     "SAFE_PAGE_SIZE": "250",

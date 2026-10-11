@@ -1,6 +1,6 @@
 # R2 归档格式 / R2 Archive Schema
 
-当前 schema version：`2`。归档对象使用 gzip 压缩的 NDJSON，并按 UTC 小时使用确定性 key：
+GraphQL 归档 schema version：`2`，继续兼容 `1`。原生 Logpush 清单版本 `3` 与趋势对象格式见本页末尾。GraphQL 对象使用 gzip 压缩的 NDJSON，并按 UTC 小时使用确定性 key：
 
 ```text
 archives/{zone_id}/{dataset}/YYYY/MM/DD/HH.ndjson.gz
@@ -44,3 +44,13 @@ R2 custom metadata and the D1 `archive_manifests` row record the schema version,
 The Access-protected API streams raw gzip bytes. Decompression, schema conversion, filtering, ordering, keyset pagination, and export happen locally in the browser. Keep the bucket private because records may contain IP addresses, full query strings, and User-Agent values.
 
 Schema v1 remains readable. Its snake_case D1 rows are converted to the current API contract in the browser, so existing objects require no bulk migration. A later repair merge naturally rewrites that hour as v2.
+
+## 原生 Logpush 与趋势
+
+`logpush/{zone_id}/{http_requests|firewall_events}/{DATE}/...gz` 为 Cloudflare 原样投递的 gzip NDJSON，**没有应用元数据行**。清单 `schema_version=3`、`status=indexed`，以对象 ETag 保证下载时清单仍对应当前对象；`sha256` 为空，不声称做过 SHA-256 校验。索引过程验证时间、RayID 和每行 JSON，记录真实最小时间、最大时间加一毫秒、条数与压缩大小。浏览器适配 PascalCase 字段并标记 `dataSource=logpush`。同一 RayID 的不同规则安全事件分别保留。
+
+`metrics/{zone_id}/{http|security}/{hour_start_epoch_ms}.json.gz` 是 gzip JSON，包含 `version: 1`、`zoneId`、`kind`、`hourStart` 和 `rows`。行保留旧 `metric_buckets` 的 snake_case 字段，以 `(bucket_start,bucket_seconds,dimension_signature)` 合并；首次接管小时包含该小时旧 D1 全部维度。只有 R2 写入成功后才更新 `metric_archives`，读侧按小时排除对应旧 D1 行，防止重复统计。
+
+`migration-backups/metrics/{zone_id}/{kind}/{hour}.json.gz` 保存该小时第一次迁移时的原始 D1 行数组。迁移先回读验证每一条待删除记录，原始备份不随后续小批回收覆盖。该前缀不得配置自动清理，直到运维明确不再需要回滚。
+
+Native Logpush manifests use version 3 and `indexed` status. Files have no application header or application SHA-256 checksum. Trend documents use a separate version-1 gzip JSON format; original D1 migration backups are retained independently for rollback. See [setup and migration](./LOGPUSH.md).

@@ -8,7 +8,9 @@ import {
   type ArchiveRecord,
   type RawArchiveDataset,
 } from "@/shared/archive-records";
-import { ApiError, endpoints, type ArchiveItem } from "@/client/api";
+import { ApiError, endpoints } from "@/client/api";
+import { parseLogpushRecord } from "@/shared/logpush";
+import { readNdjson } from "@/shared/ndjson";
 
 export async function queryArchivedRequests(
   params: URLSearchParams,
@@ -62,24 +64,46 @@ async function queryArchive(
     limit: "5000",
   });
   if (filter.zoneIds.length) manifestQuery.set("zones", filter.zoneIds.join(","));
-  const manifests = (await endpoints.archives(manifestQuery)).items;
+  const manifests = (await endpoints.archives(manifestQuery, signal)).items;
   if (manifests.length === 5_000) throw new Error("所选范围包含过多归档文件，请缩短时间范围或指定 Zone");
-
-  const matched: ArchiveRecord[] = [];
-  for (let index = 0; index < manifests.length;) {
-    const hour = manifests[index]?.range_start;
-    const hourRecords: ArchiveRecord[] = [];
-    while (index < manifests.length && manifests[index]?.range_start === hour) {
-      hourRecords.push(...await readArchive(manifests[index], dataset, signal));
-      index += 1;
+  let best = new Map<string, ArchiveRecord>();
+  let downloaded = 0;
+  const requestedSource = params.get("dataSource");
+  for (const manifest of manifests) {
+    signal?.throwIfAborted();
+    if (requestedSource === "logpush" && manifest.schema_version !== 3) continue;
+    if (requestedSource === "graphql" && manifest.schema_version === 3) continue;
+    const retained = [...best.values()].sort(compareArchiveRecords);
+    // Logpush 批次时间范围可能重叠；只能跳过确定比整页都旧的文件，不能按文件顺序提前结束。
+    if (retained.length > filter.limit && manifest.range_end <= retained[filter.limit].occurredAt) continue;
+    downloaded += manifest.compressed_bytes;
+    if (downloaded > 64 * 1024 * 1024) throw new Error("本次扫描超过 64 MiB，请缩短时间范围或选择单个 Zone；未返回不完整结果");
+    const response = await fetch(`/api/v1/archives/${encodeURIComponent(manifest.id)}/download`, { signal });
+    if (!response.ok || !response.body) throw new ApiError(`读取 R2 归档失败（HTTP ${response.status}）`, "ARCHIVE_DOWNLOAD_FAILED", response.status);
+    let header: ReturnType<typeof parseArchiveHeader> = null;
+    for await (const value of readNdjson(response.body)) {
+      let item: ArchiveRecord | null;
+      if (manifest.schema_version === 3) {
+        item = parseLogpushRecord(dataset === "httpRequestsAdaptive" ? "http_requests" : "firewall_events", manifest.zone_id, value);
+      } else if (!header) {
+        header = parseArchiveHeader(value);
+        if (!header || header.dataset !== dataset || header.zoneId !== manifest.zone_id) throw new Error("归档头与清单不一致");
+        continue;
+      } else item = parseArchiveRecord(dataset, header.schemaVersion, value);
+      if (!item) throw new Error("归档记录无效");
+      const key = archiveIdentity(item);
+      // 游标使用跨来源稳定的身份，避免上一页原生日志在下一页又以 GraphQL 记录出现。
+      item = { ...item, id: key };
+      if (!matchesArchiveFilter(item, filter)) continue;
+      const previous = best.get(key);
+      if (!previous || item.dataSource === "logpush") best.set(key, item);
+      if (best.size > (filter.limit + 1) * 2) {
+        best = new Map([...best.values()].sort(compareArchiveRecords).slice(0, filter.limit + 1).map((record) => [archiveIdentity(record), record]));
+      }
     }
-    const deduplicated = new Map(hourRecords.map((item) => [item.id, item]));
-    for (const item of [...deduplicated.values()].sort(compareArchiveRecords)) {
-      if (matchesArchiveFilter(item, filter)) matched.push(item);
-      if (matched.length > filter.limit) break;
-    }
-    if (matched.length > filter.limit) break;
+    if (manifest.schema_version !== 3 && !header) throw new Error("归档缺少元数据行");
   }
+  const matched = [...best.values()].sort(compareArchiveRecords);
   const hasMore = matched.length > filter.limit;
   const items = matched.slice(0, filter.limit);
   const last = items.at(-1);
@@ -89,14 +113,11 @@ async function queryArchive(
   };
 }
 
-async function readArchive(
-  manifest: ArchiveItem,
-  dataset: RawArchiveDataset,
-  signal?: AbortSignal,
-): Promise<ArchiveRecord[]> {
-  const response = await fetch(`/api/v1/archives/${encodeURIComponent(manifest.id)}/download`, { signal });
-  if (!response.ok) throw new ApiError(`读取 R2 归档失败（HTTP ${response.status}）`, "ARCHIVE_DOWNLOAD_FAILED", response.status);
-  return decodeArchiveResponse(response, dataset);
+function archiveIdentity(item: ArchiveRecord): string {
+  if (!item.rayId) return item.id;
+  return JSON.stringify("edgeStatus" in item
+    ? [item.zoneId, item.rayId]
+    : [item.zoneId, item.rayId, item.source, item.ruleId, item.action]);
 }
 
 export async function decodeArchiveResponse(

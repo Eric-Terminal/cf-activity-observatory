@@ -76,7 +76,7 @@ export function matchesArchiveFilter(item: ArchiveRecord, filter: DetailFilter):
 }
 
 export function compareArchiveRecords(left: ArchiveRecord, right: ArchiveRecord): number {
-  return right.occurredAt - left.occurredAt || right.id.localeCompare(left.id);
+  return right.occurredAt - left.occurredAt || (left.id < right.id ? 1 : left.id > right.id ? -1 : 0);
 }
 
 export function encodeArchiveCursor(value: { occurredAt: number; id: string }): string {
@@ -153,6 +153,7 @@ function legacyRecord(dataset: RawArchiveDataset, row: Record<string, unknown>):
 
 function requestRecord(row: Record<string, unknown>, id: string, zoneId: string, occurredAt: number): SampledRequest {
   return {
+    dataSource: row.dataSource === "logpush" ? "logpush" : "graphql",
     id, zoneId, occurredAt,
     rayId: string(row.rayId), clientIp: string(row.clientIp), country: string(row.country), asn: number(row.asn),
     asnDescription: string(row.asnDescription), userAgent: string(row.userAgent), referer: string(row.referer),
@@ -169,6 +170,7 @@ function requestRecord(row: Record<string, unknown>, id: string, zoneId: string,
 
 function eventRecord(row: Record<string, unknown>, id: string, zoneId: string, occurredAt: number): SecurityEvent {
   return {
+    dataSource: row.dataSource === "logpush" ? "logpush" : "graphql",
     id, zoneId, occurredAt,
     rayId: string(row.rayId), action: string(row.action), source: string(row.source), ruleId: string(row.ruleId),
     ruleDescription: string(row.ruleDescription), rulesetId: string(row.rulesetId), kind: string(row.kind),

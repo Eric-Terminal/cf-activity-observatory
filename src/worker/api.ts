@@ -19,6 +19,8 @@ import {
 import { loadSmtp } from "@/worker/alerts";
 import { sendSmtp } from "@/worker/smtp";
 import { jsonError, nowMs, parseCsv, parseTimeRange, sanitizeError } from "@/worker/utils";
+import { logpushApi } from "@/worker/logpush-api";
+import type { MetricArchive } from "@/shared/metrics";
 
 type Variables = { identity: AccessIdentity };
 const api = new Hono<{ Bindings: Env; Variables: Variables }>().basePath("/api/v1");
@@ -40,6 +42,7 @@ api.use("*", async (context, next) => {
 });
 
 api.get("/me", (context) => context.json(context.get("identity")));
+api.route("/logpush", logpushApi);
 
 api.get("/zones", async (context) => {
   const zones = await listZones(context.env.DB);
@@ -165,9 +168,13 @@ api.get("/archives", async (context) => {
 
 api.get("/archives/:id/download", async (context) => {
   const manifest = await getArchive(context.env.DB, context.req.param("id"));
-  if (!manifest || manifest.status !== "verified") return jsonError(context, 404, "ARCHIVE_NOT_FOUND", "归档不存在或尚未通过校验");
+  if (!manifest || !["verified", "indexed"].includes(manifest.status)) return jsonError(context, 404, "ARCHIVE_NOT_FOUND", "归档不存在或尚未完成索引");
   const object = await context.env.ARCHIVES.get(manifest.r2_key);
   if (!object) return jsonError(context, 404, "ARCHIVE_OBJECT_MISSING", "R2 对象不存在");
+  if (manifest.etag && object.etag !== manifest.etag) {
+    await object.body.cancel();
+    return jsonError(context, 409, "ARCHIVE_CHANGED", "归档已更新，请刷新清单后重试");
+  }
   return new Response(object.body, {
     headers: {
       // 不声明 Content-Encoding，浏览器才能拿到原始 gzip 字节并在本地显式流式解压。
@@ -176,6 +183,37 @@ api.get("/archives/:id/download", async (context) => {
       "Cache-Control": "private, no-store",
     },
   });
+});
+
+api.get("/metric-archives", async (context) => {
+  try {
+    const url = new URL(context.req.url);
+    const { from, to } = parseTimeRange(url.searchParams.get("from") ?? undefined, url.searchParams.get("to") ?? undefined);
+    const zones = parseCsv(url.searchParams.get("zones") ?? undefined);
+    const kind = url.searchParams.get("kind") === "security" ? "security" : "http";
+    const result = await context.env.DB.prepare(
+      `SELECT zone_id, metric_kind, hour_start, r2_key, etag, compressed_bytes FROM metric_archives
+       WHERE metric_kind = ? AND hour_start >= ? AND hour_start < ?
+       ${zones.length ? `AND zone_id IN (${zones.map(() => "?").join(",")})` : ""}
+       ORDER BY hour_start DESC LIMIT 5001`,
+    ).bind(kind, Math.floor(from / 3_600_000) * 3_600_000, to, ...zones).all<MetricArchive>();
+    if (result.results.length > 5000) return jsonError(context, 422, "METRIC_RANGE_TOO_LARGE", "趋势归档过多，请缩短时间范围或选择单个 Zone");
+    return context.json({ items: result.results });
+  } catch (error) { return jsonError(context, 422, "INVALID_METRIC_QUERY", sanitizeError(error)); }
+});
+
+api.get("/metric-archives/:zone/:kind/:hour", async (context) => {
+  const manifest = await context.env.DB.prepare(
+    "SELECT r2_key, etag FROM metric_archives WHERE zone_id = ? AND metric_kind = ? AND hour_start = ?",
+  ).bind(context.req.param("zone"), context.req.param("kind"), Number(context.req.param("hour"))).first<{ r2_key: string; etag: string }>();
+  if (!manifest) return jsonError(context, 404, "METRIC_ARCHIVE_NOT_FOUND", "趋势归档不存在");
+  const object = await context.env.ARCHIVES.get(manifest.r2_key);
+  if (!object) return jsonError(context, 404, "METRIC_ARCHIVE_MISSING", "趋势 R2 对象不存在");
+  if (object.etag !== manifest.etag || (context.req.query("etag") && context.req.query("etag") !== manifest.etag)) {
+    await object.body.cancel();
+    return jsonError(context, 409, "METRIC_ARCHIVE_CHANGED", "趋势已更新，请刷新后重试");
+  }
+  return new Response(object.body, { headers: { "Content-Type": "application/gzip", "Cache-Control": "private, no-store" } });
 });
 
 api.get("/saved-views", async (context) => {
@@ -396,6 +434,9 @@ async function queryMetrics(database: D1Database, url: URL): Promise<{ bucketSec
        FROM metric_buckets
        WHERE metric_kind = ? AND bucket_start >= ? AND bucket_start < ?${dimensionFilter}${zoneFilter}
          AND bucket_seconds <= ?
+         AND NOT EXISTS (SELECT 1 FROM metric_archives a WHERE a.zone_id = metric_buckets.zone_id
+           AND a.metric_kind = metric_buckets.metric_kind
+           AND a.hour_start = CAST(metric_buckets.bucket_start / 3600000 AS INTEGER) * 3600000)
        GROUP BY ${bucketStartSql}, ${dimensionSql}
      )
      SELECT bucket_start, dimension, estimated_count, sample_interval, confidence_lower,

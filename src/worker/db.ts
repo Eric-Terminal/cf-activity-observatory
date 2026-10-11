@@ -457,7 +457,10 @@ export async function getHealth(
         `SELECT c.zone_id, z.name AS zone_name, c.dataset, c.cursor_at, c.last_success_at,
                 c.consecutive_failures, c.last_error
          FROM sync_cursors c JOIN zones z ON z.id = c.zone_id
-         WHERE z.enabled = 1${cursorZoneFilter} ORDER BY z.name, c.dataset`,
+         WHERE z.enabled = 1${cursorZoneFilter}
+          AND NOT EXISTS (SELECT 1 FROM logpush_sources s WHERE s.zone_id = c.zone_id AND s.activated_at IS NOT NULL
+            AND s.dataset = CASE c.dataset WHEN 'httpRequestsAdaptive' THEN 'http_requests' WHEN 'firewallEventsAdaptive' THEN 'firewall_events' END)
+         ORDER BY z.name, c.dataset`,
       )
       .bind(...filter.zoneIds)
       .all<HealthCursorRow>(),
@@ -486,7 +489,7 @@ export async function getHealth(
       )
       .bind(dayKey())
       .first<UsageRow>(),
-    database.prepare("SELECT COUNT(*) AS count FROM alert_state WHERE alert_key LIKE 'dlq:%' AND status = 'active'")
+    database.prepare("SELECT COUNT(*) AS count FROM alert_state WHERE (alert_key LIKE 'dlq:%' OR alert_key LIKE 'logpush:%') AND status = 'active'")
       .first<{ count: number }>(),
   ]);
   const cursorDatasets = new Set(DATASETS);

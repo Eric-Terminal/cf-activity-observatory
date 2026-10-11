@@ -21,6 +21,7 @@ import { CloudflareApiError } from "@/worker/cloudflare";
 import { alertNeedsNotification, evaluateAlerts } from "@/worker/alerts";
 import { D1_DAILY_WRITE_PAUSE } from "@/worker/budgets";
 import worker from "@/worker/index";
+import type { MetricDocument } from "@/shared/metrics";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -245,16 +246,16 @@ describe("Worker API 与存储", () => {
       end: timestamp + 300_000,
       mode: "repair",
     });
-    const stored = await env.DB.prepare(
-      `SELECT dimension_type, dimension_value, COUNT(*) AS bucket_count,
-        COUNT(DISTINCT dimension_signature) AS signature_count
-       FROM metric_buckets WHERE zone_id = 'zone-metrics' AND bucket_seconds = 300
-       GROUP BY dimension_type, dimension_value ORDER BY dimension_type`,
-    ).all<{ dimension_type: string | null; dimension_value: string | null; bucket_count: number; signature_count: number }>();
-    expect(stored.results).toEqual([
-      { dimension_type: null, dimension_value: null, bucket_count: 2, signature_count: 1 },
-      { dimension_type: "path", dimension_value: "/ranked", bucket_count: 2, signature_count: 1 },
-    ]);
+    const file = await env.ARCHIVES.get(`metrics/zone-metrics/http/${Math.floor(timestamp / 3_600_000) * 3_600_000}.json.gz`);
+    const stored = await new Response(file!.body.pipeThrough(new DecompressionStream("gzip"))).json<MetricDocument>();
+    const base = stored.rows.filter((row) => row.dimension_type === null);
+    const ranked = stored.rows.filter((row) => row.dimension_type === "path");
+    expect(base).toHaveLength(2);
+    expect(ranked).toHaveLength(2);
+    expect(new Set(base.map((row) => row.dimension_signature)).size).toBe(1);
+    expect(new Set(ranked.map((row) => row.dimension_signature)).size).toBe(1);
+    expect(base.reduce((sum, row) => sum + row.estimated_count, 0)).toBe(20);
+    expect(ranked.reduce((sum, row) => sum + row.estimated_count, 0)).toBe(20);
     const repairedGap = await env.DB.prepare(
       "SELECT resolved_at FROM data_gaps WHERE id = 'repairable-gap'",
     ).first<{ resolved_at: number | null }>();
@@ -263,20 +264,21 @@ describe("Worker API 与存储", () => {
     const storedTiers = await env.DB.prepare(
       "SELECT DISTINCT bucket_seconds FROM metric_buckets WHERE zone_id = 'zone-metrics' ORDER BY bucket_seconds",
     ).all<{ bucket_seconds: number }>();
-    expect(storedTiers.results).toEqual([{ bucket_seconds: 300 }]);
+    expect(storedTiers.results).toEqual([]);
 
     const range = `from=${encodeURIComponent(new Date(timestamp - 3_600_000).toISOString())}&to=${encodeURIComponent(new Date(timestamp + 3_600_000).toISOString())}`;
     const totalResponse = await exports.default.fetch(`http://localhost/api/v1/metrics?kind=http&dimension=total&${range}`);
     const total = await totalResponse.json<{ series: Array<{ points: Array<{ estimated_count: number }> }> }>();
-    expect(total.series[0]?.points.reduce((sum, point) => sum + point.estimated_count, 0)).toBe(20);
+    expect(total.series).toEqual([]);
     const pathResponse = await exports.default.fetch(`http://localhost/api/v1/metrics?kind=http&dimension=path&${range}`);
     const paths = await pathResponse.json<{
       bucketSeconds: number;
       series: Array<{ name: string; points: Array<{ estimated_count: number }> }>;
     }>();
     expect(paths.bucketSeconds).toBe(3600);
-    expect(paths.series[0]?.name).toBe("/ranked");
-    expect(paths.series[0]?.points[0]?.estimated_count).toBe(20);
+    expect(paths.series).toEqual([]);
+    const manifestResponse = await exports.default.fetch(`http://localhost/api/v1/metric-archives?kind=http&zones=zone-metrics&${range}`);
+    expect(await manifestResponse.json()).toMatchObject({ items: [expect.objectContaining({ zone_id: "zone-metrics" })] });
   });
 
   it("高基数查询可连续读取旧小时排名与新五分钟排名", async () => {
@@ -713,7 +715,7 @@ describe("Worker API 与存储", () => {
     ]);
   });
 
-  it("指标超过保留边界后原子替换为唯一小时副本", async () => {
+  it("历史五分钟趋势完整迁入 R2，重复维护不改变计数", async () => {
     const scheduledAt = Math.floor(Date.now() / 3_600_000) * 3_600_000;
     const bucketStart = scheduledAt - 91 * 86_400_000;
     await insertZone("zone-rollup", "rollup.example");
@@ -738,17 +740,21 @@ describe("Worker API 与存储", () => {
       `SELECT bucket_seconds, estimated_count, updated_at FROM metric_buckets
        WHERE zone_id = 'zone-rollup' ORDER BY bucket_seconds`,
     ).all<{ bucket_seconds: number; estimated_count: number; updated_at: number }>();
-    expect(first.results).toEqual([{ bucket_seconds: 3600, estimated_count: 12, updated_at: scheduledAt }]);
+    expect(first.results).toEqual([]);
+    const file = await env.ARCHIVES.get(`metrics/zone-rollup/http/${bucketStart}.json.gz`);
+    const document = await new Response(file!.body.pipeThrough(new DecompressionStream("gzip"))).json<MetricDocument>();
+    expect(document.rows.map((row) => [row.bucket_seconds, row.estimated_count])).toEqual([[300, 5], [300, 7]]);
 
     await runMaintenance(env, scheduledAt + 3_600_000);
     const second = await env.DB.prepare(
       `SELECT bucket_seconds, estimated_count, updated_at FROM metric_buckets
        WHERE zone_id = 'zone-rollup'`,
     ).all<{ bucket_seconds: number; estimated_count: number; updated_at: number }>();
-    expect(second.results).toEqual([{ bucket_seconds: 3600, estimated_count: 12, updated_at: scheduledAt }]);
+    expect(second.results).toEqual([]);
+    expect((await env.ARCHIVES.head(`metrics/zone-rollup/http/${bucketStart}.json.gz`))?.etag).toBe(file?.etag);
   });
 
-  it("小时指标超过长期边界后原子替换为唯一每日副本", async () => {
+  it("多年历史小时趋势迁移时保留原有粒度", async () => {
     const scheduledAt = Math.floor(Date.now() / 86_400_000) * 86_400_000;
     const bucketStart = scheduledAt - 731 * 86_400_000;
     await insertZone("zone-daily-rollup", "daily-rollup.example");
@@ -769,12 +775,18 @@ describe("Worker API 与存储", () => {
     ]);
 
     await runMaintenance(env, scheduledAt);
+    await runMaintenance(env, scheduledAt);
 
     const stored = await env.DB.prepare(
       `SELECT bucket_start, bucket_seconds, estimated_count FROM metric_buckets
        WHERE zone_id = 'zone-daily-rollup'`,
     ).all<{ bucket_start: number; bucket_seconds: number; estimated_count: number }>();
-    expect(stored.results).toEqual([{ bucket_start: bucketStart, bucket_seconds: 86400, estimated_count: 21 }]);
+    expect(stored.results).toEqual([]);
+    for (const [hour, count] of [[bucketStart, 8], [bucketStart + 3_600_000, 13]]) {
+      const object = await env.ARCHIVES.get(`metrics/zone-daily-rollup/security/${hour}.json.gz`);
+      const document = await new Response(object!.body.pipeThrough(new DecompressionStream("gzip"))).json<MetricDocument>();
+      expect(document.rows).toMatchObject([{ bucket_seconds: 3600, estimated_count: count }]);
+    }
   });
 });
 

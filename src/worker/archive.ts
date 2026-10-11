@@ -6,8 +6,8 @@ import {
   type RawArchiveDataset,
 } from "@/shared/archive-records";
 import { evaluateAlerts } from "@/worker/alerts";
-import { d1WritesPaused } from "@/worker/budgets";
 import { incrementUsage, recordD1Usage } from "@/worker/db";
+import { migrateLegacyMetricHour } from "@/worker/metric-migration";
 import {
   asNumber,
   asString,
@@ -51,7 +51,7 @@ interface ArchiveListFilter {
 }
 
 export async function runMaintenance(env: Env, scheduledAt = nowMs()): Promise<void> {
-  if (!(await d1WritesPaused(env.DB))) await rollupMetrics(env.DB, scheduledAt);
+  await migrateLegacyMetricHour(env, scheduledAt);
   await evaluateAlerts(env);
   await env.DB.prepare("DELETE FROM app_settings WHERE key LIKE 'graphql_budget:%' AND updated_at < ?")
     .bind(scheduledAt - DAY_MS)
@@ -104,7 +104,7 @@ export async function listArchives(
   database: D1Database,
   filter: ArchiveListFilter = {},
 ): Promise<ArchiveManifestRow[]> {
-  const conditions = ["status = 'verified'"];
+  const conditions = ["status IN ('verified', 'indexed')"];
   const bindings: unknown[] = [];
   if (filter.dataset) {
     conditions.push("dataset = ?");
@@ -350,70 +350,6 @@ function eventFromCloudflare(zoneId: string, row: Record<string, unknown>): Secu
 
 function remaining(row: Record<string, unknown>, known: Set<string>): Record<string, unknown> {
   return Object.fromEntries(Object.entries(row).filter(([key]) => !known.has(key)));
-}
-
-async function rollupMetrics(database: D1Database, timestamp: number): Promise<void> {
-  const zones = await database.prepare("SELECT id FROM zones ORDER BY id").all<{ id: string }>();
-  for (const zone of zones.results) await compactMetricTier(database, zone.id, timestamp, 300, 3600, 90);
-  for (const zone of zones.results) await compactMetricTier(database, zone.id, timestamp, 3600, 86400, 730);
-}
-
-async function compactMetricTier(
-  database: D1Database,
-  zoneId: string,
-  timestamp: number,
-  sourceSeconds: 300 | 3600,
-  targetSeconds: 3600 | 86400,
-  minimumAgeDays: number,
-): Promise<void> {
-  const targetMs = targetSeconds * 1000;
-  const cutoff = floorTo(timestamp - minimumAgeDays * DAY_MS, targetMs);
-  const oldest = await database.prepare(
-    `SELECT bucket_start FROM metric_buckets
-     WHERE zone_id = ? AND bucket_start < ? AND bucket_seconds = ? ORDER BY bucket_start LIMIT 1`,
-  )
-    .bind(zoneId, cutoff, sourceSeconds)
-    .first<{ bucket_start: number }>();
-  if (!oldest) return;
-  const targetStart = floorTo(oldest.bucket_start, targetMs);
-  const targetEnd = targetStart + targetMs;
-  if (sourceSeconds === 3600) {
-    const finer = await database.prepare(
-      `SELECT 1 FROM metric_buckets
-       WHERE zone_id = ? AND bucket_start >= ? AND bucket_start < ? AND bucket_seconds = 300 LIMIT 1`,
-    )
-      .bind(zoneId, targetStart, targetEnd)
-      .first();
-    if (finer) return;
-  }
-  // 同一 batch 内先生成粗粒度再删除源桶，维护失败时不会留下半套趋势数据。
-  const results = await database.batch([
-    database.prepare(
-      `INSERT INTO metric_buckets
-       (zone_id, bucket_start, bucket_seconds, metric_kind, dimension_signature, host, country, asn,
-        method, protocol, edge_status, origin_status, status_class, cache_status, security_action, security_source,
-        request_source, dimension_type, dimension_value, estimated_count, sample_interval, confidence_estimate,
-        confidence_lower, confidence_upper, confidence_sample_size, edge_response_bytes, visits, updated_at)
-       SELECT zone_id, ?, ?, metric_kind, dimension_signature, host, country, asn,
-        method, protocol, edge_status, origin_status, status_class, cache_status, security_action, security_source,
-        request_source, dimension_type, dimension_value, SUM(estimated_count), AVG(sample_interval),
-        SUM(confidence_estimate), SUM(confidence_lower), SUM(confidence_upper), SUM(confidence_sample_size),
-        SUM(edge_response_bytes), SUM(visits), ?
-       FROM metric_buckets
-       WHERE zone_id = ? AND bucket_seconds = ? AND bucket_start >= ? AND bucket_start < ?
-       GROUP BY zone_id, metric_kind, dimension_signature
-       ON CONFLICT(zone_id, bucket_start, bucket_seconds, metric_kind, dimension_signature) DO UPDATE SET
-        estimated_count = excluded.estimated_count, sample_interval = excluded.sample_interval,
-        confidence_estimate = excluded.confidence_estimate, confidence_lower = excluded.confidence_lower,
-        confidence_upper = excluded.confidence_upper, confidence_sample_size = excluded.confidence_sample_size,
-        edge_response_bytes = excluded.edge_response_bytes, visits = excluded.visits, updated_at = excluded.updated_at`,
-    ).bind(targetStart, targetSeconds, timestamp, zoneId, sourceSeconds, targetStart, targetEnd),
-    database.prepare(
-      `DELETE FROM metric_buckets
-       WHERE zone_id = ? AND bucket_seconds = ? AND bucket_start >= ? AND bucket_start < ?`,
-    ).bind(zoneId, sourceSeconds, targetStart, targetEnd),
-  ]);
-  await recordD1Usage(database, results.map((result) => result.meta));
 }
 
 async function gzip(input: Uint8Array): Promise<Uint8Array> {

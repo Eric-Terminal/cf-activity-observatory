@@ -5,6 +5,7 @@ import { api, endpoints } from "@/client/api";
 import { useI18n } from "@/client/i18n";
 import { Notice, PageHeader } from "@/client/components/Layout";
 import { Badge, ErrorState, formatBytes, formatTime, Loading } from "@/client/components/Ui";
+import { LogpushPanel } from "@/client/components/LogpushPanel";
 
 interface SmtpState {
   enabled: boolean;
@@ -47,6 +48,7 @@ export function Settings() {
   return <>
     <PageHeader title={t("settings")} eyebrow="Cloudflare Workers · D1 · R2 · Queues" actions={<button className="primary" onClick={() => discover.mutate()} disabled={discover.isPending}>{discover.isPending ? t("discovering") : t("discoverZones")}</button>} />
     {discover.error && <Notice tone="warning">{discover.error.message}</Notice>}
+    <LogpushPanel />
     {(zones.isLoading || settings.isLoading) ? <Loading /> : zones.error || settings.error ? <ErrorState error={zones.error ?? settings.error} /> : <>
       <section className="settings-section"><header><div><h2>{t("zone")}</h2><p>{t("queueOperations")}: {settings.data?.estimatedDailyQueueOperations.toLocaleString()} / {settings.data?.safeDailyQueueOperations.toLocaleString()}</p></div></header><div className="zone-list">{zones.data?.zones.map((zone) => <ZoneCard key={zone.id} zone={zone} />)}{!zones.data?.zones.length && <div className="table-empty">{t("apiNotConfigured")}</div>}</div></section>
       <section className="settings-section"><header><div><h2>{t("capabilities")}</h2><p>{t("samplingHelp")}</p></div></header><div className="capability-grid">{zones.data?.capabilities.map((capability) => <article key={`${capability.zoneId}:${capability.dataset}`}><header><code>{capability.dataset}</code><Badge tone={capability.enabled ? "good" : "warn"}>{capability.enabled ? t("available") : t("unavailable")}</Badge></header><dl><dt>{t("fields")}</dt><dd>{capability.availableFields.length}</dd><dt>{t("maxHistory")}</dt><dd>{capability.notOlderThan ? `${Math.round(capability.notOlderThan / 86400)} ${t("days")}` : "—"}</dd><dt>maxPageSize</dt><dd>{capability.maxPageSize ?? "—"}</dd></dl></article>)}</div></section>

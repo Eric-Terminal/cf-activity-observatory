@@ -7,6 +7,7 @@ import { ErrorState, formatNumber, Loading } from "@/client/components/Ui";
 import { Chart } from "@/client/components/Chart";
 import { rangeDates, TimeControls, type RangeKey } from "@/client/components/TimeControls";
 import { countryMapOption } from "@/client/worldMap";
+import { useMetric } from "@/client/metrics";
 
 export function Overview() {
   const { t, locale } = useI18n();
@@ -82,18 +83,6 @@ export function Overview() {
       </section>
     </div>}
   </>;
-}
-
-function useMetric(kind: string, dimension: string, dates: { from: string; to: string }, zones: string[]) {
-  const selected = zoneKey(zones);
-  return useQuery({
-    queryKey: ["metrics", kind, dimension, dates.from.slice(0, 13), selected],
-    queryFn: () => {
-      const query = new URLSearchParams({ kind, dimension, ...dates });
-      if (selected) query.set("zones", selected);
-      return endpoints.metrics(query);
-    },
-  });
 }
 
 function zoneKey(zones: string[]): string {

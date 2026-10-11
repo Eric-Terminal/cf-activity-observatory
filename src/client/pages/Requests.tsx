@@ -35,6 +35,7 @@ export function Requests() {
     placeholderData: (previous) => previous,
   });
   const columns = useMemo(() => [
+    column.accessor("dataSource", { header: t("dataSource"), cell: (info) => <Badge tone={info.getValue() === "logpush" ? "good" : "blue"}>{info.getValue() === "logpush" ? "Logpush" : t("sampledDetail")}</Badge> }),
     column.accessor("occurredAt", { header: t("occurredAt"), cell: (info) => formatTime(info.getValue()) }),
     column.accessor("clientIp", { header: t("ip"), cell: (info) => info.getValue() ?? "—" }),
     column.display({ id: "resource", header: `${t("host")} / ${t("path")}`, cell: (info) => <span className="resource-cell"><strong>{info.row.original.host ?? "—"}</strong><small>{info.row.original.path ?? "/"}</small></span> }),
@@ -68,12 +69,14 @@ export function Requests() {
     setParams(next);
   }
   return <>
-    <PageHeader title={t("requests")} eyebrow={t("sampledDetail")} actions={<><div className="saved-view-actions"><select aria-label={t("savedViews")} value={selectedViewId} onChange={(event) => { setSelectedViewId(event.target.value); const view = savedViews.data?.items.find((item) => item.id === event.target.value); if (view) { const next = new URLSearchParams(view.filters); setDraft(view.filters); setHistory([]); setParams(next); } }}><option value="">{t("savedViews")}</option>{savedViews.data?.items.filter((item) => item.page === "requests").map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select><button onClick={() => { const name = window.prompt(t("viewName")); if (name?.trim()) saveView.mutate(name.trim()); }}>{t("saveCurrentView")}</button>{selectedViewId && <><button onClick={() => { const view = savedViews.data?.items.find((item) => item.id === selectedViewId); const name = window.prompt(t("viewName"), view?.name); if (view && name?.trim()) renameView.mutate({ id: view.id, name: name.trim(), filters: view.filters }); }}>{t("rename")}</button><button onClick={() => deleteView.mutate(selectedViewId)}>{t("delete")}</button></>}</div><TimeControls range={range} setRange={(nextRange) => { const dates = rangeDates(nextRange); const next = new URLSearchParams(params); next.set("from", dates.from); next.set("to", dates.to); next.delete("cursor"); setRangeState(nextRange); setHistory([]); setParams(next); }} /></>} />
+    <PageHeader title={t("requests")} eyebrow={t("requestDetail")} actions={<><div className="saved-view-actions"><select aria-label={t("savedViews")} value={selectedViewId} onChange={(event) => { setSelectedViewId(event.target.value); const view = savedViews.data?.items.find((item) => item.id === event.target.value); if (view) { const next = new URLSearchParams(view.filters); setDraft(view.filters); setHistory([]); setParams(next); } }}><option value="">{t("savedViews")}</option>{savedViews.data?.items.filter((item) => item.page === "requests").map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select><button onClick={() => { const name = window.prompt(t("viewName")); if (name?.trim()) saveView.mutate(name.trim()); }}>{t("saveCurrentView")}</button>{selectedViewId && <><button onClick={() => { const view = savedViews.data?.items.find((item) => item.id === selectedViewId); const name = window.prompt(t("viewName"), view?.name); if (view && name?.trim()) renameView.mutate({ id: view.id, name: name.trim(), filters: view.filters }); }}>{t("rename")}</button><button onClick={() => deleteView.mutate(selectedViewId)}>{t("delete")}</button></>}</div><TimeControls range={range} setRange={(nextRange) => { const dates = rangeDates(nextRange); const next = new URLSearchParams(params); next.set("from", dates.from); next.set("to", dates.to); next.delete("cursor"); setRangeState(nextRange); setHistory([]); setParams(next); }} /></>} />
     <Notice><strong>{t("sampling")}</strong><span>{t("samplingHelp")}</span></Notice>
     <Notice><strong>{t("browserArchive")}</strong><span>{t("browserArchiveHelp")}</span></Notice>
     <form className="filter-panel" onSubmit={applyFilters}>
       <header><h2>{t("filters")}</h2><button type="button" className="ghost" onClick={() => { const dates = rangeDates("24h"); setDraft({}); setParams(new URLSearchParams({ ...dates, limit: "100" })); }}>{t("reset")}</button></header>
       <div className="filter-grid">
+        <label><span>{t("dataSource")}</span><select value={draft.dataSource ?? ""} onChange={(event) => setDraft((current) => ({ ...current, dataSource: event.target.value }))}><option value="">{t("allSources")}</option><option value="logpush">Logpush</option><option value="graphql">{t("graphqlSource")}</option></select></label>
+        <Filter label={t("zone")} name="zones" value={draft.zones} set={setDraft} />
         <Filter label={t("ip")} name="ip" value={draft.ip} set={setDraft} />
         <Filter label={t("country")} name="country" value={draft.country} set={setDraft} />
         <Filter label={t("asn")} name="asn" value={draft.asn} set={setDraft} />
@@ -93,7 +96,7 @@ export function Requests() {
       <footer><button className="primary" type="submit">{t("search")}</button></footer>
     </form>
     <section className="panel table-panel">
-      <div className="table-meta"><Badge tone="blue">{t("sampledDetail")}</Badge><span>{query.data?.items.length ?? 0} {t("records")}</span></div>
+      <div className="table-meta"><Badge tone="blue">{t("requestDetail")}</Badge><span>{query.data?.items.length ?? 0} {t("records")}</span></div>
       {query.isLoading ? <Loading /> : query.error ? <ErrorState error={query.error} retry={() => void query.refetch()} /> : <div className="table-scroll"><table><thead>{table.getHeaderGroups().map((group) => <tr key={group.id}>{group.headers.map((header) => <th key={header.id}>{flexRender(header.column.columnDef.header, header.getContext())}</th>)}</tr>)}</thead><tbody>{table.getRowModel().rows.map((row) => <tr key={row.id} onClick={() => setSelected(row.original)} tabIndex={0} onKeyDown={(event) => event.key === "Enter" && setSelected(row.original)}>{row.getVisibleCells().map((cell) => <td key={cell.id}>{flexRender(cell.column.columnDef.cell, cell.getContext())}</td>)}</tr>)}</tbody></table>{!query.data?.items.length && <div className="table-empty">{t("noData")}</div>}</div>}
       <div className="pagination"><button disabled={!history.length} onClick={previousPage}>{t("previousPage")}</button><button disabled={!query.data?.nextCursor} onClick={nextPage}>{t("nextPage")}</button></div>
     </section>

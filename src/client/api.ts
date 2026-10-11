@@ -81,6 +81,6 @@ export const endpoints = {
   events: (query: URLSearchParams) => api<PaginatedResult<SecurityEvent>>(`/security-events?${query}`),
   event: (id: string) => api<SecurityEvent>(`/security-events/${encodeURIComponent(id)}`),
   health: (query?: URLSearchParams) => api<CollectorHealth>(`/health${query?.size ? `?${query}` : ""}`),
-  archives: (query?: URLSearchParams) => api<{ items: ArchiveItem[] }>(`/archives${query?.size ? `?${query}` : ""}`),
+  archives: (query?: URLSearchParams, signal?: AbortSignal) => api<{ items: ArchiveItem[] }>(`/archives${query?.size ? `?${query}` : ""}`, { signal }),
   settings: () => api<AppSettings>("/settings"),
 };

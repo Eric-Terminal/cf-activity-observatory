@@ -38,7 +38,10 @@ export async function evaluateAlerts(env: Env): Promise<void> {
     `SELECT c.zone_id, z.name AS zone_name, c.dataset, c.consecutive_failures, c.last_success_at,
       c.last_error, z.poll_interval_minutes
      FROM sync_cursors c JOIN zones z ON z.id = c.zone_id
-     WHERE z.enabled = 1 AND (c.consecutive_failures >= 3 OR c.last_success_at < ?)`,
+     WHERE z.enabled = 1 AND (c.consecutive_failures >= 3 OR c.last_success_at < ?)
+      AND NOT EXISTS (SELECT 1 FROM logpush_sources s WHERE s.zone_id = c.zone_id AND s.activated_at IS NOT NULL
+       AND ((s.dataset = 'http_requests' AND c.dataset = 'httpRequestsAdaptive')
+        OR (s.dataset = 'firewall_events' AND c.dataset = 'firewallEventsAdaptive')))`,
   )
     .bind(timestamp - 15 * 60_000)
     .all<Record<string, unknown>>();
@@ -77,7 +80,7 @@ export async function evaluateAlerts(env: Env): Promise<void> {
     .all<{ alert_key: string; details: string }>();
   for (const state of open.results) {
     // DLQ 没有可靠的自动清空信号；保留状态，直到运维确认并显式处理对应记录。
-    if (state.alert_key.startsWith("dlq:")) continue;
+    if (state.alert_key.startsWith("dlq:") || state.alert_key.startsWith("logpush:")) continue;
     // 预算暂停时无法观测采集器是否已经恢复，既不新增陈旧告警，也不制造假恢复。
     if (collectionPaused && state.alert_key.startsWith("collector:")) continue;
     if (!active.has(state.alert_key)) {
