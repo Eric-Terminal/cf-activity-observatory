@@ -25,6 +25,19 @@ test("趋势图可展开并通过 Escape 返回总览", async ({ page }) => {
   await expect(page.getByRole("dialog")).toHaveCount(0);
 });
 
+test("没有安全事件时仍展示有数据的请求趋势", async ({ page }) => {
+  await page.route("**/api/v1/metrics?**", async (route) => {
+    const url = new URL(route.request().url());
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(
+      url.searchParams.get("kind") === "security" ? { bucketSeconds: 300, series: [] } : fixture(url.pathname),
+    ) });
+  });
+  await page.goto("/");
+  await expect(page.getByRole("button", { name: "展开图表：请求与缓解趋势" })).toBeVisible();
+  const security = page.getByRole("article").filter({ has: page.getByRole("heading", { name: "安全动作", exact: true }) });
+  await expect(security.getByText("当前范围暂无数据")).toBeVisible();
+});
+
 test("多系列趋势可以只显示指定状态", async ({ page }) => {
   await page.goto("/");
   const panel = page.getByRole("article").filter({ has: page.getByRole("heading", { name: "状态码趋势" }) });

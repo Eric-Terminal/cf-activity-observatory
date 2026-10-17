@@ -14,8 +14,9 @@ export function Chart({ option, title, height = 320 }: { option: Record<string, 
   const matchingSeries = selectedSeries?.filter((name) => seriesNames.includes(name)) ?? [];
   const visibleSeries = selectedSeries === null || (selectedSeries.length > 0 && matchingSeries.length === 0) ? seriesNames : matchingSeries;
   const displayedOption = useMemo(() => withSeriesSelection(option, seriesNames, visibleSeries), [option, seriesNames, visibleSeries]);
-  const serialized = JSON.stringify(displayedOption);
-  const hasData = serialized.includes('"data":[') && !serialized.includes('"data":[]');
+  // 某个系列为空不代表整张图为空，例如尚无安全事件时仍应展示请求趋势。
+  const hasData = Array.isArray(displayedOption.series) && displayedOption.series.some((series: { data?: unknown }) =>
+    Array.isArray(series.data) && series.data.length > 0);
 
   useEffect(() => {
     const dialog = dialogRef.current;
