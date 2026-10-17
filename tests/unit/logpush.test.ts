@@ -14,6 +14,7 @@ describe("原生 Logpush 格式与流读取", () => {
     expect(parseLogpushKey(`logpush/${zone}/http_requests/20261010/a.log.gz`)).toEqual({ zoneId: zone, dataset: "http_requests" });
     expect(parseLogpushKey(`archives/${zone}/httpRequestsAdaptive/2026/10/10/12.ndjson.gz`)).toBeNull();
     expect(parseLogpushKey(`logpush/${zone}/http_requests/ownership-challenge.txt`)).toBeNull();
+    expect(parseLogpushKey(`logpush/${zone}/http_requests/00010101/test.txt.gz`)).toBeNull();
   });
 
   it("兼容三种时间格式，不把缺失时间伪装为当前时间", () => {
@@ -36,6 +37,15 @@ describe("原生 Logpush 格式与流读取", () => {
     const b = parseLogpushRecord("firewall_events", zone, { ...event, RuleID: "two" });
     expect(a.id).not.toBe(b.id);
     expect(a).toMatchObject({ source: "firewallRules", dataSource: "logpush" });
+  });
+
+  it("保留当前 Logpush 数据集的攻击评分和安全事件客户端信息", () => {
+    expect(parseLogpushRecord("http_requests", zone, { ...http("scored"), WAFAttackScore: 17 }))
+      .toMatchObject({ attackScore: 17 });
+    expect(parseLogpushRecord("firewall_events", zone, {
+      Datetime: new Date(timestamp).toISOString(), RayID: "firewall", ClientCountry: "CN",
+      ClientRequestUserAgent: "Test browser", ClientRequestPath: "/search", ClientRequestQuery: "q=test",
+    })).toMatchObject({ country: "CN", userAgent: "Test browser", path: "/search", query: "q=test" });
   });
 
   it("跨块 UTF-8、空行与末尾无换行均可读取", async () => {

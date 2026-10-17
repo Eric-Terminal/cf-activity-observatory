@@ -24,8 +24,8 @@ export interface LogpushSource {
 }
 
 export const LOGPUSH_FIELDS: Record<LogpushDataset, string[]> = {
-  http_requests: ["EdgeStartTimestamp", "RayID", "ClientIP", "ClientCountry", "ClientASN", "ClientRequestHost", "ClientRequestPath", "ClientRequestURI", "ClientRequestMethod", "ClientRequestProtocol", "ClientRequestUserAgent", "ClientRequestReferer", "ClientDeviceType", "ClientRequestSource", "EdgeColoCode", "CacheCacheStatus", "OriginResponseStatus", "EdgeResponseStatus", "SecurityAction", "SecurityRuleID", "SecuritySources", "BotScore", "BotScoreSrc", "BotTags", "WAFScore"],
-  firewall_events: ["Datetime", "RayID", "Action", "Source", "RuleID", "Description", "Kind", "ClientIP", "ClientCountryName", "ClientASN", "ClientRequestHost", "ClientRequestPath", "ClientRequestQuery", "ClientRequestMethod", "UserAgent"],
+  http_requests: ["EdgeStartTimestamp", "RayID", "ClientIP", "ClientCountry", "ClientASN", "ClientRequestHost", "ClientRequestPath", "ClientRequestURI", "ClientRequestMethod", "ClientRequestProtocol", "ClientRequestUserAgent", "ClientRequestReferer", "ClientDeviceType", "ClientRequestSource", "EdgeColoCode", "CacheCacheStatus", "OriginResponseStatus", "EdgeResponseStatus", "SecurityAction", "SecurityRuleID", "SecuritySources", "BotScore", "BotScoreSrc", "BotTags", "WAFAttackScore"],
+  firewall_events: ["Datetime", "RayID", "Action", "Source", "RuleID", "Description", "Kind", "ClientIP", "ClientCountry", "ClientASN", "ClientRequestHost", "ClientRequestPath", "ClientRequestQuery", "ClientRequestMethod", "ClientRequestUserAgent"],
 };
 
 export function logpushPrefix(zoneId: string, dataset: LogpushDataset): string {
@@ -33,7 +33,8 @@ export function logpushPrefix(zoneId: string, dataset: LogpushDataset): string {
 }
 
 export function parseLogpushKey(key: string): { zoneId: string; dataset: LogpushDataset } | null {
-  const match = /^logpush\/([a-f0-9]{32})\/(http_requests|firewall_events)\/[^\0]+\.gz$/u.exec(key);
+  // Cloudflare 会投递 test.txt.gz 验证目标；只有 .log.gz 批次才包含请求或安全事件。
+  const match = /^logpush\/([a-f0-9]{32})\/(http_requests|firewall_events)\/[^\0]+\.log\.gz$/u.exec(key);
   return match ? { zoneId: match[1], dataset: logpushDatasetSchema.parse(match[2]) } : null;
 }
 
@@ -65,7 +66,7 @@ export function parseLogpushRecord(dataset: LogpushDataset, zoneId: string, valu
     cacheStatus: row.CacheCacheStatus, originStatus: row.OriginResponseStatus, edgeStatus: row.EdgeResponseStatus,
     securityAction: row.SecurityAction, securitySource: Array.isArray(row.SecuritySources) ? row.SecuritySources.join(", ") : null,
     securityRuleId: row.SecurityRuleID, botScore: row.BotScore, botScoreSource: row.BotScoreSrc,
-    botTags: row.BotTags, attackScore: row.WAFScore,
+    botTags: row.BotTags, attackScore: row.WAFAttackScore,
   } : {
     ...common, action: row.Action, source: row.Source, ruleId: row.RuleID,
     ruleDescription: row.Description, rulesetId: row.RulesetID, kind: row.Kind,

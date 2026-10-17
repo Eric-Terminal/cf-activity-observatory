@@ -53,6 +53,15 @@ describe("Logpush 索引与切换", () => {
     await reconcileLogpush(env, id, "firewall_events");
     expect(await env.DB.prepare("SELECT 1 FROM logpush_sources WHERE zone_id = ?").bind(id).first()).toBeNull();
   });
+
+  it("目标校验文件不会被当成业务日志或建立来源状态", async () => {
+    const id = "7".repeat(32);
+    await zone(id);
+    const key = `logpush/${id}/http_requests/00010101/test.txt.gz`;
+    await env.ARCHIVES.put(key, await new Response(new Blob(['{"content":"test"}']).stream().pipeThrough(new CompressionStream("gzip"))).arrayBuffer());
+    expect(await indexLogpushObject(env, key)).toBe(false);
+    expect(await env.DB.prepare("SELECT 1 FROM logpush_sources WHERE zone_id = ?").bind(id).first()).toBeNull();
+  });
 });
 
 describe("R2 趋势存储", () => {

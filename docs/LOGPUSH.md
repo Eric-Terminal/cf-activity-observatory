@@ -39,10 +39,14 @@ Logpush 投递不依赖应用或 D1 是否可用。索引失败时原始对象�
 
    若界面已经勾选“按日期组织子目录”，路径只填写日期前的部分，避免重复添加。设置页可复制包含 `{DATE}` 的完整对象路径用于 API 配置。
 
-4. 选择默认 NDJSON gzip 格式，时间使用 RFC3339，采样设为 100%，不添加过滤条件。HTTP 必须包含 `EdgeStartTimestamp`、`RayID`；安全事件必须包含 `Datetime`、`RayID`。其他推荐字段见设置页，以当前套餐可用字段为准。不要启用包含请求 Cookie、认证头或请求体的自定义字段。
+4. 选择默认 NDJSON gzip 格式，时间使用 RFC3339，采样设为 100%，不添加过滤条件。HTTP 必须包含 `EdgeStartTimestamp`、`RayID`；安全事件必须包含 `Datetime`、`RayID`。其他推荐字段见设置页，以当前套餐可用字段为准；API 配置前用 `GET /zones/{zone_id}/logpush/datasets/{dataset}/fields` 核对，省略不可用的 Bot 字段。HTTP 攻击评分字段为 `WAFAttackScore`，安全事件国家和 User-Agent 字段为 `ClientCountry`、`ClientRequestUserAgent`。不要启用包含请求 Cookie、认证头或请求体的自定义字段。
 5. 作业批次设置 `max_upload_bytes: 5000000`、`max_upload_interval_seconds: 300`；该字节参数按未压缩大小计算。应用拒绝解压后超过 64 MiB 的单文件，避免 Worker 内存耗尽。
 6. R2 凭据只配置在 Cloudflare Logpush 中；应用无需获得 R2 S3 密钥或额外的 Logs Write Token。
 7. 收到文件并完成索引后，检查最新投递时间与文件数，再按数据集点击“切换到 Logpush”。切换前仍采集 GraphQL 明细，切换后只停对应明细，Groups 继续工作。没有过去 24 小时内收到的有效文件时，接口会拒绝切换。
+
+Cloudflare 创建或校验目标时会写入 `00010101/test.txt.gz`，它不是业务日志。应用只索引 `.log.gz` 批次，校验文件不会令来源显示为已就绪。
+
+Logpush 作业及其 R2 凭据独立于 Worker 部署。正常重新部署应用不会重建作业或令牌；只有撤销、过期或轮换投递所用的 R2 令牌时，才需要更新作业目标凭据。用于创建作业的临时 Logs Edit 令牌可在配置完成后删除，运行中的作业不依赖它。
 
 官方说明：[R2 目标配置](https://developers.cloudflare.com/logs/logpush/logpush-job/enable-destinations/r2/)、[R2 通知](https://developers.cloudflare.com/r2/buckets/event-notifications/)、[作业 API](https://developers.cloudflare.com/logs/logpush/logpush-job/api-configuration/)。
 
