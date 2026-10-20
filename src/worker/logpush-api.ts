@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { logpushDatasetSchema, LOGPUSH_FIELDS } from "@/shared/logpush";
 import { listLogpushSources } from "@/worker/logpush";
 import { nowMs } from "@/worker/utils";
+import { incrementUsage } from "@/worker/db";
 
 export const logpushApi = new Hono<{ Bindings: Env }>();
 
@@ -20,6 +21,7 @@ logpushApi.post("/:zone/:dataset/:action", async (context) => {
   const action = context.req.param("action");
   if (action === "reconcile") {
     await context.env.COLLECTOR_QUEUE.send({ version: 1, type: "reconcile-logpush", zoneId, dataset: parsed.data });
+    await incrementUsage(context.env.DB, { queueMessages: 1 });
     return context.json({ queued: true }, 202);
   }
   if (action === "activate") {

@@ -43,6 +43,7 @@ export const collectorJobSchema = z.discriminatedUnion("type", [
     zoneId: z.string().regex(/^[a-f0-9]{32}$/u),
     dataset: z.enum(["http_requests", "firewall_events"]),
     cursor: z.string().optional(),
+    after: z.string().startsWith("logpush/").max(1024).optional(),
   }),
 ]);
 

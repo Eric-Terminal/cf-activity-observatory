@@ -808,8 +808,8 @@ describe("安全边界与协议细节", () => {
     expect(collectionWindowDuration(300)).toBe(300_000);
   });
 
-  it("Queue 预算估算包含四数据集实时任务和每小时修复", () => {
-    expect(estimateDailyQueueOperations([{ enabled: true, pollIntervalMinutes: 5 }])).toBe(3_744);
+  it("Queue 预算估算包含四数据集实时任务、每小时修复和定时日志核对", () => {
+    expect(estimateDailyQueueOperations([{ enabled: true, pollIntervalMinutes: 5 }])).toBe(5_478);
     expect(estimateDailyQueueOperations([{ enabled: false, pollIntervalMinutes: 1 }])).toBe(0);
   });
   it("执行 SMTP dot stuffing 并生成标准 MIME", () => {

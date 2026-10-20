@@ -167,6 +167,7 @@ export async function incrementUsage(
   database: D1Database,
   columns: Partial<{
     workerInvocations: number;
+    // 沿用存储字段名；数值为操作估算：发送一次、消费读取一次、成功确认删除一次。
     queueMessages: number;
     graphqlQueries: number;
     r2ClassA: number;

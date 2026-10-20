@@ -466,7 +466,10 @@ async function saveView(database: D1Database, id: string, input: SavedViewInput,
 }
 
 export function estimateDailyQueueOperations(zones: Array<{ enabled: boolean; pollIntervalMinutes: number }>): number {
+  // 这是基础调度量；高密度窗口拆分、日志扫描续页和重试仍需额外余量。
+  const logpushScans = (1440 / 5 + 1) * 2 * 3;
   return Math.ceil(
-    zones.filter((zone) => zone.enabled).reduce((total, zone) => total + (1440 / zone.pollIntervalMinutes) * 4 * 3 + 4 * 24 * 3, 0),
+    zones.filter((zone) => zone.enabled).reduce((total, zone) =>
+      total + (1440 / zone.pollIntervalMinutes) * 4 * 3 + 4 * 24 * 3 + logpushScans, 0),
   );
 }

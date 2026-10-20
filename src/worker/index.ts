@@ -37,9 +37,11 @@ export default {
         const key = notification.success ? notification.data.object.key : nativeJob?.type === "index-logpush" ? nativeJob.key : null;
         try {
           if (notification.success && notification.data.bucket !== env.ARCHIVE_BUCKET_NAME) throw new Error("R2 通知来自未绑定的桶");
-          await incrementUsage(env.DB, { workerInvocations: 1, queueMessages: 1 });
+          // 普通任务的发送已在生产者计数；R2 通知的写入由平台完成，需要在首次读取时补计。
+          await incrementUsage(env.DB, { workerInvocations: 1, queueMessages: notification.success && message.attempts === 1 ? 2 : 1 });
           if (key) await indexLogpushObject(env, key);
-          if (nativeJob?.type === "reconcile-logpush") await reconcileLogpush(env, nativeJob.zoneId, nativeJob.dataset, nativeJob.cursor);
+          if (nativeJob?.type === "reconcile-logpush") await reconcileLogpush(env, nativeJob.zoneId, nativeJob.dataset, nativeJob.cursor, nativeJob.after);
+          await incrementUsage(env.DB, { queueMessages: 1 });
           message.ack();
         } catch (error) {
           console.error(JSON.stringify({ event: "logpush_index_failed", error: sanitizeError(error) }));
@@ -68,6 +70,7 @@ export default {
             console.info(JSON.stringify({ event: "collection_deferred", outcome, jobId: parsed.data.id }));
           }
         } else await runMaintenance(env, parsed.data.scheduledAt);
+        await incrementUsage(env.DB, { queueMessages: 1 });
         message.ack();
       } catch (error) {
         console.error(JSON.stringify({ event: "queue_job_failed", jobId: parsed.data.id, error: sanitizeError(error) }));

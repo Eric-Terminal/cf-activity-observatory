@@ -7,7 +7,7 @@ import {
   type DatasetResult,
 } from "@/worker/cloudflare";
 import { archiveDetailRows } from "@/worker/archive";
-import { usesLogpush } from "@/worker/logpush";
+import { scheduleLogpushScans, usesLogpush } from "@/worker/logpush";
 import { storeMetricRows } from "@/worker/metric-archive";
 import type { StoredMetric } from "@/shared/metrics";
 import { getCapability, incrementUsage, recordD1Usage } from "@/worker/db";
@@ -51,6 +51,7 @@ interface CollectStats {
 }
 
 export async function dispatchScheduled(env: Env, scheduledAt = nowMs()): Promise<void> {
+  let sent = await scheduleLogpushScans(env, scheduledAt);
   const collectionPaused = await d1WritesPaused(env.DB);
   if (collectionPaused) await rememberPausedWindow(env.DB, scheduledAt);
   else await enqueuePausedRepairs(env, scheduledAt);
@@ -66,7 +67,6 @@ export async function dispatchScheduled(env: Env, scheduledAt = nowMs()): Promis
       .bind(scheduledAt)
       .all<{ id: string; poll_interval_minutes: number }>();
 
-  let sent = 0;
   for (const zone of due.results) {
     await ensureCapabilities(env, zone.id);
     for (const dataset of DATASETS) {

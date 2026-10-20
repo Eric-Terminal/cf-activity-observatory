@@ -27,7 +27,7 @@ GraphQL 明细不等于每一个请求，网页会标记数据来源。趋势图
 - 请求探索器支持组合筛选、URL 恢复和保存视图；归档页可在浏览器本地生成 CSV、JSON、NDJSON。
 - 校正请求/缓解趋势、动作分布、国家地图，以及 path、IP、ASN、User-Agent、规则的独立高基数 cube。
 - schema v2 归档使用 API 同形的 camelCase 记录；网页仍兼容历史 schema v1 D1 原始行，不需要迁移已有 R2 对象。
-- Logpush 原始文件由 R2 通知驱动幂等索引，可按数据集安全切换、恢复 GraphQL 与扫描补索引。
+- Logpush 每五分钟批量索引新文件，每日全量核对补漏，可按数据集安全切换、恢复 GraphQL 与扫描补索引。
 - 趋势按小时合并进 R2，D1 不再逐维度写入；历史趋势先备份、回读验证，再受预算限制小批回收 D1 副本。
 - Workers Free 额度预算：GraphQL 240 次/5 分钟软上限、Queue 20% 安全余量、历史回填最多使用 D1 每日写入额度的 20%，应用内 D1 写入计数达到每日额度的 70% 时暂停并在 UTC 零点续传。
 - Cloudflare Access JWT 验证、状态修改同源保护、严格安全响应头。
@@ -44,8 +44,8 @@ flowchart LR
   Collector --> D1[(D1 游标/清单)]
   Collector --> R2[(R2 明细与趋势归档)]
   Logpush[Cloudflare Logpush] --> R2
-  R2 --> Events[对象创建通知]
-  Events --> Queue
+  Cron --> Scan[定时批量核对日志]
+  Scan --> Queue
   Queue --> Maintenance[历史迁移与告警任务]
   Browser[Access 保护的 WebUI] --> API[Hono /api/v1]
   API --> D1
@@ -155,7 +155,7 @@ Worker 会按照 Cloudflare 的 [Access JWT 验证方式](https://developers.clo
 
 ## 免费额度估算
 
-默认按 Workers Free 的常见额度设计。单 Zone、四个数据集、5 分钟频率的基础 Queue 发送/接收/确认估算约 3744 次/日，另外预留修复、重试和用户其他调用。设置页计算所有 Zone 的预计消耗；超过 8000 次/日会拒绝保存。
+默认按 Workers Free 的常见额度设计。单 Zone、四个 GraphQL 数据集、5 分钟频率加上两路 Logpush 定时核对，基础 Queue 发送/接收/确认估算约 5478 次/日。启用 Logpush 后对应 GraphQL 明细停止；高密度窗口拆分、日志扫描续页、回填、重试和其他应用仍会增加实际操作数。设置页计算所有 Zone 的基础预计消耗，超过 8000 次/日会拒绝保存；这不保证真实用量不会触及账号上限。
 
 明细与新增趋势维度不再写入 D1。GraphQL 回填沿用 20,000 行写入安全线，总写入计数达到 70,000 行时暂停 GraphQL 采集并在额度重置后补采；历史回收达到 50,000 行时提前暂停。原生 Logpush 继续直接投递 R2，索引失败可重建。应用估算不包含全部控制语句或其他应用用量；新 Logpush 订阅、R2 与 Queue 费用请单独核对，见 [接入说明](./docs/LOGPUSH.md)。
 

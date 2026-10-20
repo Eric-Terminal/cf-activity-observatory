@@ -7,8 +7,8 @@ Cloudflare 的 Observability 将导出入口集中起来。本项目使用 **Log
 ```mermaid
 flowchart LR
   CF[Cloudflare Logpush] --> R2[(私有 R2 原始日志)]
-  R2 --> Notify[R2 对象创建通知]
-  Notify --> Queue[串行 Collector Queue]
+  Cron[每五分钟检查 / 每日全量核对] --> Queue[串行 Collector Queue]
+  Queue --> R2
   Queue --> Index[(D1 文件清单)]
   GQL[GraphQL Adaptive Groups] --> Queue
   Queue --> Metrics[(R2 小时趋势)]
@@ -17,18 +17,16 @@ flowchart LR
   Web --> Metrics
 ```
 
-Logpush 投递不依赖应用或 D1 是否可用。索引失败时原始对象保留，可在设置页“重建索引”；该操作按 R2 continuation cursor 扫描全部页面。重复通知按对象 ETag 跳过，修改后的对象重新解析。
+Logpush 投递不依赖应用或 D1 是否可用。每五分钟扫描标准 Logpush 文件名对应的最近两小时，UTC 00:17 全量核对历史文件，补回迟到、配额耗尽期间和非标准文件名的漏索引。正常情况下索引比投递晚约五分钟；排队和重试会延长等待。
+
+每条扫描任务列出最多 1000 个对象，按 D1 中的 ETag 跳过未变文件，直接处理最多七个新文件，再用一条消息继续剩余部分，不为每个正常文件产生消息。页内续传使用最后处理的对象键，整页完成后才使用 R2 cursor。损坏文件独立重试并报警，不阻塞后续文件。设置页“重建索引”可随时发起全量核对；原始对象不会因索引失败而删除。
 
 趋势依旧使用 Adaptive Groups 的校正估算，按 Zone / HTTP 或安全 / 小时保存一个 gzip JSON。D1 只更新小时索引，路径、IP 等高基数维度不会逐行写入数据库。一个时间范围的图表共享一次归档读取与聚合，排名维度不会重复计入总量。
 
 ## 配置投递
 
 1. 先应用 `0006_native_logpush.sql`，部署新版应用，确认设置页列出了目标 Zone。
-2. 为现有桶添加对象创建通知，只匹配 `logpush/` 前缀，避免趋势与历史归档触发循环：
-
-   ```bash
-   node ./node_modules/wrangler/bin/wrangler.js r2 bucket notification create cf-activity-observatory-archives --event-type object-create --queue cf-activity-observatory --prefix 'logpush/'
-   ```
+2. 不配置逐文件 R2 队列通知。升级旧部署时，先验证定时扫描能够建立新索引，再移除原 `logpush/` 对象创建通知规则；Logpush 作业及原始文件保留。消费者仍能处理切换前已经排队的通知。
 
 3. 在 Cloudflare 的 Zone → Logpush 中选择 R2 自定义目标。桶使用 `cf-activity-observatory-archives`；两个数据集分别使用以下路径，启用日期子目录：
 
@@ -55,6 +53,8 @@ Logpush 作业及其 R2 凭据独立于 Worker 部署。正常重新部署应用
 “Logpush”仅表示数据来源。作业可能配置过滤或采样，应用不会据此伪造采样率或声称覆盖所有请求。历史 GraphQL 明细保留来源标识，旧 v1/v2 对象不需要重写。
 
 截至 2026-10-11，Cloudflare 自助 Logpush 向 R2 等内部目标每账户每月包含 25 GB，超出为 $0.03/GB，按成功投递的未压缩字节计量；R2、Queue 与 Workers 的费用独立计算。启用新订阅前应确认账单页面，最新信息以 [Logpush 定价](https://developers.cloudflare.com/logs/logpush/pricing/) 为准。
+
+Queues Free 每日包含 10000 次操作，正常一条消息需写入、读取、删除三次操作；`sendBatch` 不会减少计费次数。因此日志使用一条任务处理多个文件，而不是只增大消费批次。应用计数包含生产、每次消费读取和成功确认；R2 旧通知的生产计数在首次消费时补计。该修正从 2026-10-20 部署起生效，之前日期及部署当日早些时候的旧计数未追溯修正，不可当作 Cloudflare 账单。直接调用队列 API 的人工任务、死信转移和其他应用仍可能造成偏差。[Queues 定价](https://developers.cloudflare.com/queues/platform/pricing/)
 
 单次明细查询最多扫描 5000 个索引、下载 64 MiB 压缩数据，单文件最多解压 64 MiB。超出会明确报错，不把部分扫描伪装为完整结果。可缩短到一小时、限定 Zone 或数据来源。趋势扫描最多下载 64 MiB、合计解压 128 MiB。导出仍为所选范围最新 500 条；全量备份应下载原始 R2 文件。
 
