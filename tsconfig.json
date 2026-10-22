@@ -15,7 +15,7 @@
     "isolatedModules": true,
     "noEmit": true,
     "jsx": "react-jsx",
-    "types": ["./worker-configuration.d.ts", "vitest/globals", "@cloudflare/vitest-pool-workers/types"],
+    "types": ["./worker-configuration.d.ts", "vitest/globals", "@cloudflare/vitest-plugin/types"],
     "baseUrl": ".",
     "paths": {
       "@/*": ["src/*"]
