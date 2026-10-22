@@ -74,10 +74,14 @@ export async function dispatchScheduled(env: Env, scheduledAt = nowMs()): Promis
       const capability = await getCapability(env.DB, zone.id, dataset);
       if (!capability?.enabled) continue;
       const acquired = await acquireWindow(env, zone.id, dataset, capability, scheduledAt);
-      if (!acquired) continue;
-      if (acquired.mode === "backfill") {
+      // 历史任务因预算延后时仍持有租约；最近窗口单独调度，不能被历史等待拖停。
+      // 已追上实时的游标不会产生额外任务，补采租约与游标也保持原样。
+      const coveredUntil = acquired?.end ?? await env.DB.prepare(
+        "SELECT cursor_at FROM sync_cursors WHERE zone_id = ? AND dataset = ?",
+      ).bind(zone.id, dataset).first<number>("cursor_at");
+      if (coveredUntil !== null) {
         const liveEnd = floorTo(scheduledAt - DATA_DELAY_MS, MINUTE_MS);
-        const liveStart = Math.max(liveEnd - zone.poll_interval_minutes * MINUTE_MS, acquired.end);
+        const liveStart = Math.max(liveEnd - zone.poll_interval_minutes * MINUTE_MS, coveredUntil);
         if (liveStart < liveEnd) {
           await env.COLLECTOR_QUEUE.send({
             version: 1,
@@ -93,6 +97,7 @@ export async function dispatchScheduled(env: Env, scheduledAt = nowMs()): Promis
           sent += 1;
         }
       }
+      if (!acquired) continue;
       const job: CollectorJob = {
         version: 1,
         type: "collect",
@@ -163,6 +168,13 @@ export async function processCollectJob(
     await startRun(env.DB, job, startedAt);
     const result = await collectWindow(env, capability, job, stats);
     await advanceCursor(env.DB, job);
+    if (result === "complete" && job.mode === "repair" && budgetClass === "live") {
+      // 实时修复成功也代表采集正常，但不能推进历史游标或释放仍在等待的补采租约。
+      await env.DB.prepare(
+        `UPDATE sync_cursors SET last_success_at = ?, consecutive_failures = 0,
+         last_error = NULL, updated_at = ? WHERE zone_id = ? AND dataset = ?`,
+      ).bind(nowMs(), nowMs(), job.zoneId, job.dataset).run();
+    }
     await finishRun(env.DB, job.id, result === "split" ? "split" : "success", stats, null);
     await resolveJobAlert(env.DB, job.id);
     return result === "split" ? "split" : "collected";
